@@ -37,7 +37,7 @@ pub use image::{FilterMethod, Handle};
 use std::borrow::Cow;
 
 /// Creates a new [`Viewer`] with the given image `Handle`.
-pub fn viewer<Handle>(handle: Handle) -> Viewer<Handle> {
+pub fn viewer<'a, Handle, Message>(handle: Handle) -> Viewer<'a, Handle, Message> {
     Viewer::new(handle)
 }
 

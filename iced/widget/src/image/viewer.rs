@@ -180,14 +180,30 @@ where
             }
             // A physical mouse wheel reports discrete `Lines` notches, so it
             // can only ever mean "zoom" here and needs no modifier. A
-            // trackpad's two-finger scroll reports continuous `Pixels` and
-            // is ambiguous with panning/scrolling intent, so it stays
-            // gated behind Ctrl (real trackpad pinch, below, needs no
-            // modifier either since that gesture is already unambiguous).
+            // trackpad's two-finger scroll reports continuous `Pixels`; with
+            // Ctrl held that also zooms, but without Ctrl it pans instead
+            // (free diagonal movement, since x and y move independently —
+            // exactly like the two fingers). Panning is a no-op when the
+            // image isn't larger than the viewport, since `offset()` clamps
+            // it away at draw time.
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let state = tree.state.downcast_mut::<State>();
                 let is_physical_wheel = matches!(delta, mouse::ScrollDelta::Lines { .. });
+
                 if !is_physical_wheel && !state.modifiers.control() {
+                    let mouse::ScrollDelta::Pixels { x, y } = *delta else {
+                        return;
+                    };
+
+                    if x == 0.0 && y == 0.0 {
+                        return;
+                    }
+
+                    state.current_offset =
+                        state.current_offset - Vector::new(x, y);
+
+                    shell.request_redraw();
+                    shell.capture_event();
                     return;
                 }
 

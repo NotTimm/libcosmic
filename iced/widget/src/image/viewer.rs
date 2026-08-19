@@ -178,12 +178,16 @@ where
                 let state = tree.state.downcast_mut::<State>();
                 state.modifiers = *modifiers;
             }
-            // Mouse-wheel zoom is gated behind Ctrl so plain scrolling never
-            // hijacks the wheel; trackpad/touchscreen pinch (below) needs no
-            // modifier since the gesture is already unambiguous.
+            // A physical mouse wheel reports discrete `Lines` notches, so it
+            // can only ever mean "zoom" here and needs no modifier. A
+            // trackpad's two-finger scroll reports continuous `Pixels` and
+            // is ambiguous with panning/scrolling intent, so it stays
+            // gated behind Ctrl (real trackpad pinch, below, needs no
+            // modifier either since that gesture is already unambiguous).
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let state = tree.state.downcast_mut::<State>();
-                if !state.modifiers.control() {
+                let is_physical_wheel = matches!(delta, mouse::ScrollDelta::Lines { .. });
+                if !is_physical_wheel && !state.modifiers.control() {
                     return;
                 }
 

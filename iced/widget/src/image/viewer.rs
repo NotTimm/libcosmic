@@ -199,8 +199,29 @@ where
                         return;
                     }
 
-                    state.current_offset =
-                        state.current_offset - Vector::new(x, y);
+                    let scaled_size = scaled_image_size(
+                        renderer,
+                        &self.handle,
+                        state,
+                        bounds.size(),
+                        self.content_fit,
+                    );
+                    let hidden_width = ((scaled_size.width - bounds.width) / 2.0)
+                        .max(0.0)
+                        .round();
+                    let hidden_height = ((scaled_size.height - bounds.height) / 2.0)
+                        .max(0.0)
+                        .round();
+
+                    let unclamped = state.current_offset - Vector::new(x, y);
+                    // Clamp immediately (not just at draw time) so reversing
+                    // direction after hitting an edge moves the page right
+                    // away instead of first having to "unwind" however far
+                    // past the edge the scroll would otherwise have gone.
+                    state.current_offset = Vector::new(
+                        unclamped.x.clamp(-hidden_width, hidden_width),
+                        unclamped.y.clamp(-hidden_height, hidden_height),
+                    );
 
                     shell.request_redraw();
                     shell.capture_event();
@@ -390,12 +411,13 @@ where
                         bounds.size(),
                         self.content_fit,
                     );
-                    let hidden_width = (scaled_size.width - bounds.width / 2.0)
+                    let hidden_width = ((scaled_size.width - bounds.width) / 2.0)
                         .max(0.0)
                         .round();
 
-                    let hidden_height = (scaled_size.height
-                        - bounds.height / 2.0)
+                    let hidden_height = ((scaled_size.height
+                        - bounds.height)
+                        / 2.0)
                         .max(0.0)
                         .round();
 
@@ -579,11 +601,15 @@ impl State {
     /// Returns the current offset of the [`State`], given the bounds
     /// of the [`Viewer`] and its image.
     fn offset(&self, bounds: Rectangle, image_size: Size) -> Vector {
+        // Half the overflow on each axis: at this offset the image's edge
+        // lands exactly on the viewport's edge. The previous formula
+        // (`size - bounds / 2`) let the image slide well past its own edge
+        // into blank space, most noticeably top-to-bottom on tall pages.
         let hidden_width =
-            (image_size.width - bounds.width / 2.0).max(0.0).round();
+            ((image_size.width - bounds.width) / 2.0).max(0.0).round();
 
         let hidden_height =
-            (image_size.height - bounds.height / 2.0).max(0.0).round();
+            ((image_size.height - bounds.height) / 2.0).max(0.0).round();
 
         Vector::new(
             self.current_offset.x.clamp(-hidden_width, hidden_width),

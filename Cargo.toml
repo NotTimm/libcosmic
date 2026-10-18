@@ -14,7 +14,7 @@ default = [
     "a11y",
     "dbus-config",
     "x11",
-    "iced-wayland",
+    "wayland",
     "multi-window",
 ]
 advanced-shaping = ["iced/advanced-shaping"]
@@ -72,6 +72,7 @@ serde-keycode = ["iced_core/serde"]
 single-instance = ["iced_winit/single-instance", "zbus/blocking-api", "ron"]
 # smol async runtime
 smol = ["dep:smol", "iced/smol", "zbus?/async-io", "rfd?/async-std"]
+# Tokio async runtime
 tokio = [
     "dep:tokio",
     "ashpd?/tokio",
@@ -80,22 +81,18 @@ tokio = [
     "zbus?/tokio",
     "cosmic-config/tokio",
 ]
-# Tokio async runtime
 # Wayland window support
-iced-wayland = [
-    "ashpd?/wayland",
+wayland = [
     "autosize",
+    "surface-message",
+    "cctk",
+    "multi-window",
+    "winit",
+    "ashpd?/wayland",
     "iced/wayland",
     "iced_winit/wayland",
-    "surface-message",
-]
-wayland = [
-    "iced-wayland",
-    "iced_runtime/cctk",
-    "iced_winit/cctk",
-    "iced_wgpu/cctk",
-    "iced/cctk",
-    "dep:cctk",
+    "iced_runtime/wayland",
+    "iced_wgpu/wayland",
 ]
 surface-message = []
 # multi-window support
@@ -123,11 +120,9 @@ x11 = ["iced/x11", "iced_winit/x11"]
 
 [dependencies]
 apply = "0.3.0"
-ashpd = { version = "0.12.3", default-features = false, optional = true }
 async-fs = { version = "2.2", optional = true }
 async-std = { workspace = true, optional = true }
 auto_enums = "0.8.8"
-cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "c253ec1", optional = true }
 jiff = "0.2"
 cosmic-config = { path = "cosmic-config" }
 cosmic-settings-config = { git = "https://github.com/pop-os/cosmic-settings-daemon", optional = true }
@@ -170,12 +165,16 @@ url = "2.5.8"
 zbus = { workspace = true, optional = true }
 float-cmp = "0.10.0"
 ron = { workspace = true, optional = true }
+enumflags2 = "0.7.12"
+roxmltree = "0.20"
 
 # Enable DBus feature on Linux targets
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "c0cff4d", optional = true }
 cosmic-config = { path = "cosmic-config", features = ["dbus"] }
 cosmic-settings-daemon = { git = "https://github.com/pop-os/dbus-settings-bindings" }
 zbus.workspace = true
+ashpd = { version = "0.12.3", default-features = false, optional = true }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 freedesktop-icons = { package = "cosmic-freedesktop-icons", git = "https://github.com/pop-os/freedesktop-icons" }
@@ -256,7 +255,13 @@ serde = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tokio = "1.52"
-zbus = {version = "5.15", default-features = false}
+zbus = { version = "5.15", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[workspace.package]
+edition = "2024"
+
+[build-dependencies]
+build_helpers = { path = "./iced/build_helpers" }

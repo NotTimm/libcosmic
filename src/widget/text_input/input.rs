@@ -43,6 +43,12 @@ thread_local! {
     static LAST_FOCUS_UPDATE: LazyCell<Cell<Instant>> = LazyCell::new(|| Cell::new(Instant::now()));
 }
 
+/// Notify all text inputs that a different widget has taken focus.
+/// This causes any focused text input to unfocus on its next layout.
+pub fn notify_focus_change() {
+    LAST_FOCUS_UPDATE.with(|x| x.set(Instant::now()));
+}
+
 /// Creates a new [`TextInput`].
 ///
 /// [`TextInput`]: widget::TextInput
@@ -212,6 +218,7 @@ pub struct TextInput<'a, Message> {
     /// The text input tracks and manages the input value in its state.
     manage_value: bool,
     drag_threshold: f32,
+    window_id: window::Id,
 }
 
 impl<'a, Message> TextInput<'a, Message>
@@ -262,6 +269,7 @@ where
             always_active: false,
             manage_value: false,
             drag_threshold: 20.0,
+            window_id: crate::widget::text_context_menu::current_window_id(),
         }
     }
 
@@ -525,7 +533,7 @@ where
     }
 
     /// Sets the start dnd handler of the [`TextInput`].
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     pub fn on_start_dnd(mut self, on_start_dnd: impl Fn(State) -> Message + 'a) -> Self {
         self.on_create_dnd_source = Some(Box::new(on_start_dnd));
         self
@@ -576,6 +584,17 @@ where
     pub fn drag_threshold(mut self, drag_threshold: f32) -> Self {
         self.drag_threshold = drag_threshold;
         self
+    }
+
+    fn uses_popup_context_menu(&self) -> bool {
+        #[cfg(all(wayland_platform, feature = "winit"))]
+        if matches!(
+            crate::app::cosmic::WINDOWING_SYSTEM.get(),
+            Some(crate::app::cosmic::WindowingSystem::Wayland)
+        ) {
+            return true;
+        }
+        false
     }
 }
 
@@ -843,6 +862,24 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
+        if !self.uses_popup_context_menu() {
+            let has_context_menu = tree
+                .state
+                .downcast_ref::<State>()
+                .context_menu_position
+                .is_some();
+            if has_context_menu {
+                let menu_bar_state = tree.state.downcast_ref::<State>().menu_bar_state.clone();
+                return crate::widget::text_context_menu::context_menu_overlay(
+                    self,
+                    tree,
+                    self.on_input.as_deref(),
+                    translation,
+                    menu_bar_state,
+                );
+            }
+        }
+
         let mut layout_ = Vec::with_capacity(2);
         if self.leading_icon.is_some() {
             let mut children = self.text_layout(layout).children();
@@ -857,7 +894,7 @@ where
             }
             layout_.push(children.next().unwrap());
         };
-        let children = self
+        let children: Vec<overlay::Element<'_, Message, crate::Theme, crate::Renderer>> = self
             .leading_icon
             .iter_mut()
             .chain(self.trailing_icon.iter_mut())
@@ -868,7 +905,7 @@ where
                     .as_widget_mut()
                     .overlay(state, layout, renderer, viewport, translation)
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         (!children.is_empty()).then(|| Group::with_children(children).overlay())
     }
@@ -884,6 +921,16 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        #[cfg(all(wayland_platform, feature = "winit"))]
+        if self.uses_popup_context_menu() {
+            let menu_bar_state = tree.state.downcast_ref::<State>().menu_bar_state.clone();
+            crate::widget::text_context_menu::dismiss_popup_on_event(
+                &menu_bar_state,
+                event,
+                self.window_id,
+            );
+        }
+
         let text_layout = self.text_layout(layout);
         let mut trailing_icon_layout = None;
         let font = self.font.unwrap_or_else(|| renderer.default_font());
@@ -936,6 +983,23 @@ where
             }
         }
 
+        // Unfocus on any click outside widget bounds.
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Touch(touch::Event::FingerPressed { .. })
+        ) && cursor_position.position_over(layout.bounds()).is_none()
+        {
+            let state = tree.state.downcast_mut::<State>();
+            state.is_focused = None;
+            state.context_menu_position = None;
+            state.dragging_state = None;
+            if let Some(on_unfocus) = self.on_unfocus.as_ref() {
+                shell.publish(on_unfocus.clone());
+            }
+            return;
+        }
+
         let state = tree.state.downcast_mut::<State>();
 
         if let Some(on_unfocus) = self.on_unfocus.as_ref() {
@@ -976,6 +1040,77 @@ where
             self.drag_threshold,
             self.always_active,
         );
+
+        // On Wayland: if right-click just set context_menu_position, create a popup instead.
+        #[cfg(all(wayland_platform, feature = "winit"))]
+        if matches!(
+            crate::app::cosmic::WINDOWING_SYSTEM.get(),
+            Some(crate::app::cosmic::WindowingSystem::Wayland)
+        ) {
+            let state = tree.state.downcast_ref::<State>();
+            if state.context_menu_position.is_some() {
+                let selected_text = state
+                    .cursor()
+                    .selection(&state.tracked_value)
+                    .map(|(start, end)| state.tracked_value.select(start, end).to_string());
+                let has_selection = selected_text.is_some();
+                let has_text = !state.tracked_value.is_empty();
+                let clipboard_has_text = state.clipboard_has_text;
+                let click_position = state.context_menu_position.unwrap();
+                let menu_bar_state = state.menu_bar_state.clone();
+                let pending_action = state.pending_action.clone();
+
+                crate::widget::text_context_menu::create_text_context_popup(
+                    click_position,
+                    selected_text,
+                    true,
+                    has_selection,
+                    has_text,
+                    clipboard_has_text,
+                    &menu_bar_state,
+                    &pending_action,
+                    renderer,
+                    viewport,
+                    cursor_position,
+                    self.window_id,
+                );
+
+                let state = tree.state.downcast_mut::<State>();
+                state.context_menu_position = None;
+            }
+
+            // Process deferred actions from the popup.
+            let state = tree.state.downcast_ref::<State>();
+            let pending_action = state.pending_action.clone();
+            if let Some(action) =
+                crate::widget::text_context_menu::take_pending_action(&pending_action)
+            {
+                let state = tree.state.downcast_mut::<State>();
+                match action {
+                    crate::widget::text_context_menu::TextCtxAction::Copy => {}
+                    crate::widget::text_context_menu::TextCtxAction::Cut => {
+                        let contents = state.delete_selection();
+                        if let Some(on_input) = self.on_input.as_deref() {
+                            shell.publish((on_input)(contents));
+                        }
+                    }
+                    crate::widget::text_context_menu::TextCtxAction::Paste => {
+                        let content: String = clipboard
+                            .read(iced_core::clipboard::Kind::Standard)
+                            .unwrap_or_default();
+                        let filtered: String =
+                            content.chars().filter(|c| !c.is_control()).collect();
+                        let contents = state.paste_text(&filtered);
+                        if let Some(on_input) = self.on_input.as_deref() {
+                            shell.publish((on_input)(contents));
+                        }
+                    }
+                    crate::widget::text_context_menu::TextCtxAction::SelectAll => {
+                        state.select_all();
+                    }
+                }
+            }
+        }
 
         let state = tree.state.downcast_mut::<State>();
         let value = if self.is_secure {
@@ -1461,11 +1596,45 @@ pub fn update<'a, Message: Clone + 'static>(
     #[cold]
     fn cold() {}
 
+    let state = state();
+
+    // Any click outside clears focus and selection.
+    if matches!(
+        event,
+        Event::Mouse(mouse::Event::ButtonPressed(_))
+            | Event::Touch(touch::Event::FingerPressed { .. })
+    ) && cursor.position_over(layout.bounds()).is_none()
+    {
+        state.is_focused = None;
+        state.context_menu_position = None;
+        state.dragging_state = None;
+        if let Some(on_unfocus) = on_unfocus {
+            shell.publish(on_unfocus.clone());
+        }
+        return;
+    }
+
     match event {
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+            if let Some(pos) = cursor.position_over(layout.bounds()) {
+                if !state.is_focused() {
+                    state.focus();
+                }
+                state.context_menu_position = Some(pos);
+                state.clipboard_has_text = iced_core::widget::text::clipboard_has_text(clipboard);
+                shell.capture_event();
+                return;
+            }
+        }
+
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
         | Event::Touch(touch::Event::FingerPressed { .. }) => {
             cold();
-            let state = state();
+
+            if state.context_menu_position.take().is_some() {
+                shell.capture_event();
+                return;
+            }
 
             let click_position = if on_input.is_some() || manage_value {
                 cursor.position_over(layout.bounds())
@@ -1553,7 +1722,7 @@ pub fn update<'a, Message: Clone + 'static>(
                     click.kind(),
                     state.cursor().state(value),
                 ) {
-                    #[cfg(all(feature = "wayland", target_os = "linux"))]
+                    #[cfg(wayland_platform)]
                     (None, click::Kind::Single, cursor::State::Selection { start, end }) => {
                         let left = start.min(end);
                         let right = end.max(start);
@@ -1680,6 +1849,7 @@ pub fn update<'a, Message: Clone + 'static>(
 
                 state.last_click = Some(click);
 
+                shell.request_redraw();
                 shell.capture_event();
                 return;
             } else {
@@ -1693,8 +1863,7 @@ pub fn update<'a, Message: Clone + 'static>(
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
         | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
             cold();
-            let state = state();
-            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            #[cfg(wayland_platform)]
             if matches!(state.dragging_state, Some(DraggingState::PrepareDnd(_))) {
                 // clear selection and place cursor at click position
                 update_cache(state, value);
@@ -1721,8 +1890,6 @@ pub fn update<'a, Message: Clone + 'static>(
         }
         Event::Mouse(mouse::Event::CursorMoved { position })
         | Event::Touch(touch::Event::FingerMoved { position, .. }) => {
-            let state = state();
-
             if matches!(state.dragging_state, Some(DraggingState::Selection)) {
                 let target = {
                     let text_bounds = text_layout.bounds();
@@ -1746,10 +1913,11 @@ pub fn update<'a, Message: Clone + 'static>(
                     .cursor
                     .select_range(state.cursor.start(value), position);
 
+                shell.request_redraw();
                 shell.capture_event();
                 return;
             }
-            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            #[cfg(wayland_platform)]
             if let Some(DraggingState::PrepareDnd(start_position)) = state.dragging_state {
                 let distance = ((position.x - start_position.x).powi(2)
                     + (position.y - start_position.y).powi(2))
@@ -1810,7 +1978,6 @@ pub fn update<'a, Message: Clone + 'static>(
             modifiers,
             ..
         }) => {
-            let state = state();
             state.keyboard_modifiers = *modifiers;
 
             if let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) {
@@ -2072,6 +2239,9 @@ pub fn update<'a, Message: Clone + 'static>(
                         if let Some(on_unfocus) = on_unfocus {
                             shell.publish(on_unfocus.clone());
                         }
+
+                        shell.request_redraw();
+                        return;
                     }
 
                     keyboard::Key::Named(keyboard::key::Named::Tab) => {
@@ -2099,16 +2269,18 @@ pub fn update<'a, Message: Clone + 'static>(
                     _ => {}
                 }
 
+                shell.request_redraw();
                 shell.capture_event();
                 return;
             }
         }
         Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-            let state = state();
-
             if state.is_focused() {
                 match key {
                     keyboard::Key::Character(c) if "v" == c => {
+                        state.is_pasting = None;
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Insert) => {
                         state.is_pasting = None;
                     }
                     keyboard::Key::Named(keyboard::key::Named::Tab)
@@ -2124,73 +2296,65 @@ pub fn update<'a, Message: Clone + 'static>(
             }
         }
         Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-            let state = state();
-
             state.keyboard_modifiers = *modifiers;
         }
-        Event::InputMethod(event) => {
-            let state = state();
-
-            match event {
-                input_method::Event::Opened | input_method::Event::Closed => {
-                    state.preedit = matches!(event, input_method::Event::Opened)
-                        .then(input_method::Preedit::new);
-                    shell.capture_event();
-                    return;
-                }
-                input_method::Event::Preedit(content, selection) => {
-                    if state.is_focused() {
-                        state.preedit = Some(input_method::Preedit {
-                            content: content.to_owned(),
-                            selection: selection.clone(),
-                            text_size: Some(size.into()),
-                        });
-                        shell.capture_event();
-                        return;
-                    }
-                }
-                input_method::Event::Commit(text) => {
-                    let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) else {
-                        return;
-                    };
-                    let Some(on_input) = on_input else {
-                        return;
-                    };
-                    if state.is_read_only {
-                        return;
-                    }
-
-                    focus.updated_at = Instant::now();
-                    LAST_FOCUS_UPDATE.with(|x| x.set(focus.updated_at));
-
-                    let mut editor = Editor::new(unsecured_value, &mut state.cursor);
-                    editor.paste(Value::new(&text));
-
-                    let contents = editor.contents();
-                    let unsecured_value = Value::new(&contents);
-                    let message = if let Some(paste) = &on_paste {
-                        (paste)(contents)
-                    } else {
-                        (on_input)(contents)
-                    };
-                    shell.publish(message);
-
-                    state.is_pasting = None;
-                    let value = if is_secure {
-                        unsecured_value.secure()
-                    } else {
-                        unsecured_value
-                    };
-
-                    update_cache(state, &value);
+        Event::InputMethod(event) => match event {
+            input_method::Event::Opened | input_method::Event::Closed => {
+                state.preedit =
+                    matches!(event, input_method::Event::Opened).then(input_method::Preedit::new);
+                shell.capture_event();
+                return;
+            }
+            input_method::Event::Preedit(content, selection) => {
+                if state.is_focused() {
+                    state.preedit = Some(input_method::Preedit {
+                        content: content.to_owned(),
+                        selection: selection.clone(),
+                        text_size: Some(size.into()),
+                    });
                     shell.capture_event();
                     return;
                 }
             }
-        }
-        Event::Window(window::Event::RedrawRequested(now)) => {
-            let state = state();
+            input_method::Event::Commit(text) => {
+                let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) else {
+                    return;
+                };
+                let Some(on_input) = on_input else {
+                    return;
+                };
+                if state.is_read_only {
+                    return;
+                }
 
+                focus.updated_at = Instant::now();
+                LAST_FOCUS_UPDATE.with(|x| x.set(focus.updated_at));
+
+                let mut editor = Editor::new(unsecured_value, &mut state.cursor);
+                editor.paste(Value::new(&text));
+
+                let contents = editor.contents();
+                let unsecured_value = Value::new(&contents);
+                let message = if let Some(paste) = &on_paste {
+                    (paste)(contents)
+                } else {
+                    (on_input)(contents)
+                };
+                shell.publish(message);
+
+                state.is_pasting = None;
+                let value = if is_secure {
+                    unsecured_value.secure()
+                } else {
+                    unsecured_value
+                };
+
+                update_cache(state, &value);
+                shell.capture_event();
+                return;
+            }
+        },
+        Event::Window(window::Event::RedrawRequested(now)) => {
             if let Some(focus) = state.is_focused.as_mut().filter(|f| f.focused) {
                 focus.now = *now;
 
@@ -2206,10 +2370,9 @@ pub fn update<'a, Message: Clone + 'static>(
                 shell.request_redraw();
             }
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Source(SourceEvent::Finished | SourceEvent::Cancelled)) => {
             cold();
-            let state = state();
             if matches!(state.dragging_state, Some(DraggingState::Dnd(..))) {
                 // TODO: restore value in text input
                 state.dragging_state = None;
@@ -2217,7 +2380,7 @@ pub fn update<'a, Message: Clone + 'static>(
                 return;
             }
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(
             rectangle,
             OfferEvent::Enter {
@@ -2228,7 +2391,6 @@ pub fn update<'a, Message: Clone + 'static>(
             },
         )) if *rectangle == Some(dnd_id) => {
             cold();
-            let state = state();
             let is_clicked = text_layout.bounds().contains(Point {
                 x: *x as f32,
                 y: *y as f32,
@@ -2267,12 +2429,10 @@ pub fn update<'a, Message: Clone + 'static>(
                 return;
             }
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(rectangle, OfferEvent::Motion { x, y }))
             if *rectangle == Some(dnd_id) =>
         {
-            let state = state();
-
             let target = {
                 let text_bounds = text_layout.bounds();
 
@@ -2295,10 +2455,9 @@ pub fn update<'a, Message: Clone + 'static>(
             shell.capture_event();
             return;
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(rectangle, OfferEvent::Drop)) if *rectangle == Some(dnd_id) => {
             cold();
-            let state = state();
             if let DndOfferState::HandlingOffer(mime_types, _action) = state.dnd_offer.clone() {
                 let Some(mime_type) = SUPPORTED_TEXT_MIME_TYPES
                     .iter()
@@ -2313,15 +2472,14 @@ pub fn update<'a, Message: Clone + 'static>(
 
             return;
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(id, OfferEvent::LeaveDestination)) if Some(dnd_id) != *id => {}
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(
             rectangle,
             OfferEvent::Leave | OfferEvent::LeaveDestination,
         )) => {
             cold();
-            let state = state();
             // ASHLEY TODO we should be able to reset but for now we don't if we are handling a
             // drop
             match state.dnd_offer {
@@ -2333,12 +2491,11 @@ pub fn update<'a, Message: Clone + 'static>(
             shell.capture_event();
             return;
         }
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         Event::Dnd(DndEvent::Offer(rectangle, OfferEvent::Data { data, mime_type }))
             if *rectangle == Some(dnd_id) =>
         {
             cold();
-            let state = state();
             if matches!(&state.dnd_offer, DndOfferState::Dropped) {
                 state.dnd_offer = DndOfferState::None;
                 if !SUPPORTED_TEXT_MIME_TYPES.contains(&mime_type.as_str()) || data.is_empty() {
@@ -2616,9 +2773,9 @@ pub fn draw<'a, Message>(
     let actual_width = text_width.max(text_bounds.width);
 
     let radius_0 = THEME.lock().unwrap().cosmic().corner_radii.radius_0.into();
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     let handling_dnd_offer = !matches!(state.dnd_offer, DndOfferState::None);
-    #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+    #[cfg(not(wayland_platform))]
     let handling_dnd_offer = false;
     let (cursors, offset, is_selecting) = if let Some(focus) =
         state.is_focused.filter(|f| f.focused).or_else(|| {
@@ -2749,14 +2906,17 @@ pub fn draw<'a, Message>(
             effective_alignment(state.value.raw()),
         );
 
-        if cursors.is_empty() {
-            renderer.with_translation(Vector::ZERO, |_| {});
-        } else {
-            renderer.with_translation(Vector::new(alignment_offset - offset, 0.0), |renderer| {
+        let shift = Vector::new(alignment_offset - offset, 0.0);
+        let fill_cursors = |renderer: &mut crate::Renderer| {
+            renderer.with_translation(shift, |renderer| {
                 for (quad, color) in &cursors {
                     renderer.fill_quad(*quad, *color);
                 }
             });
+        };
+
+        if !is_selecting {
+            fill_cursors(renderer);
         }
 
         let bounds = Rectangle {
@@ -2771,27 +2931,39 @@ pub fn draw<'a, Message>(
             text_color
         };
 
-        renderer.fill_text(
-            Text {
-                content: if text.is_empty() {
-                    placeholder.to_string()
-                } else {
-                    text.clone()
-                },
-                font,
-                bounds: bounds.size(),
-                size: iced::Pixels(size),
-                align_x: text::Alignment::Default,
-                align_y: alignment::Vertical::Center,
-                line_height: text::LineHeight::default(),
-                shaping: text::Shaping::Advanced,
-                wrapping: text::Wrapping::None,
-                ellipsize: text::Ellipsize::None,
+        let text = Text {
+            content: if text.is_empty() {
+                placeholder.to_string()
+            } else {
+                text.clone()
             },
-            bounds.position(),
-            color,
-            text_bounds,
-        );
+            font,
+            bounds: bounds.size(),
+            size: iced::Pixels(size),
+            align_x: text::Alignment::Default,
+            align_y: alignment::Vertical::Center,
+            line_height: text::LineHeight::default(),
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::None,
+            ellipsize: text::Ellipsize::None,
+        };
+        renderer.fill_text(text.clone(), bounds.position(), color, text_bounds);
+
+        // Redraw the same text in the selected color, clipped to the selection quads,
+        // so glyph shaping and positioning stay identical to the unselected pass.
+        if is_selecting {
+            fill_cursors(renderer);
+            for (quad, _) in &cursors {
+                renderer.with_layer(quad.bounds + shift, |renderer| {
+                    renderer.fill_text(
+                        text.clone(),
+                        bounds.position(),
+                        appearance.selected_text_color,
+                        text_bounds,
+                    );
+                });
+            }
+        }
     };
 
     // FIXME: we always must clip with a layer because of what appears to be a tiny-skia text clipping issue.
@@ -2868,7 +3040,7 @@ pub fn mouse_interaction(
 #[derive(Debug, Clone)]
 pub struct TextInputString(pub String);
 
-#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[cfg(wayland_platform)]
 impl AsMimeTypes for TextInputString {
     fn available(&self) -> Cow<'static, [String]> {
         Cow::Owned(
@@ -2892,13 +3064,13 @@ impl AsMimeTypes for TextInputString {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DraggingState {
     Selection,
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     PrepareDnd(Point),
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     Dnd(DndAction, String),
 }
 
-#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[cfg(wayland_platform)]
 #[derive(Debug, Default, Clone)]
 pub(crate) enum DndOfferState {
     #[default]
@@ -2907,11 +3079,11 @@ pub(crate) enum DndOfferState {
     Dropped,
 }
 #[derive(Debug, Default, Clone)]
-#[cfg(not(all(feature = "wayland", target_os = "linux")))]
+#[cfg(not(wayland_platform))]
 pub(crate) struct DndOfferState;
 
 /// The state of a [`TextInput`].
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 #[must_use]
 pub struct State {
     pub tracked_value: Value,
@@ -2934,6 +3106,20 @@ pub struct State {
     preedit: Option<Preedit>,
     keyboard_modifiers: keyboard::Modifiers,
     scroll_offset: f32,
+    context_menu_position: Option<iced_core::Point>,
+    clipboard_has_text: bool,
+    pub(crate) menu_bar_state: crate::widget::menu::MenuBarState,
+    pub(crate) pending_action: crate::widget::text_context_menu::PendingAction,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State")
+            .field("is_secure", &self.is_secure)
+            .field("is_read_only", &self.is_read_only)
+            .field("dirty", &self.dirty)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2978,12 +3164,12 @@ impl State {
             cursor::State::Selection { start, end } => {
                 let left = start.min(end);
                 let right = end.max(start);
-                Some(text[left..right].to_string())
+                Some(value.select(left, right).to_string())
             }
         }
     }
 
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     /// Returns the current value of the dragged text in the [`TextInput`].
     #[must_use]
     pub fn dragged_text(&self) -> Option<String> {
@@ -3016,6 +3202,10 @@ impl State {
             keyboard_modifiers: keyboard::Modifiers::default(),
             scroll_offset: 0.0,
             dirty: false,
+            context_menu_position: None,
+            clipboard_has_text: false,
+            menu_bar_state: crate::widget::menu::MenuBarState::default(),
+            pending_action: crate::widget::text_context_menu::pending_action(),
         }
     }
 
@@ -3060,7 +3250,7 @@ impl State {
     /// Unfocuses the [`TextInput`].
     #[cold]
     pub(super) fn unfocus(&mut self) {
-        self.move_cursor_to_front();
+        self.cursor.clear_selection();
         self.last_click = None;
         self.is_focused = self.is_focused.map(|mut f| {
             f.focused = false;
@@ -3100,6 +3290,33 @@ impl State {
     #[inline]
     pub fn select_range(&mut self, start: usize, end: usize) {
         self.cursor.select_range(start, end);
+    }
+
+    /// Returns the context menu position, if a context menu should be shown.
+    pub fn context_menu_position(&self) -> Option<iced_core::Point> {
+        self.context_menu_position
+    }
+
+    /// Sets or clears the context menu position.
+    pub fn set_context_menu_position(&mut self, pos: Option<iced_core::Point>) {
+        self.context_menu_position = pos;
+    }
+
+    /// Deletes the current selection and returns the new text content.
+    pub fn delete_selection(&mut self) -> String {
+        let mut editor = super::editor::Editor::new(&mut self.tracked_value, &mut self.cursor);
+        editor.delete();
+        editor.contents()
+    }
+
+    /// Pastes text at the current cursor position and returns the new text content.
+    pub fn paste_text(&mut self, text: &str) -> String {
+        let paste_value = super::value::Value::new(text);
+        let mut editor = super::editor::Editor::new(&mut self.tracked_value, &mut self.cursor);
+        editor.paste(paste_value);
+        let contents = editor.contents();
+        self.tracked_value = super::value::Value::new(&contents);
+        contents
     }
 
     pub(super) fn setting_selection(&mut self, value: &Value, bounds: Rectangle<f32>, target: f32) {
@@ -3327,5 +3544,57 @@ fn effective_alignment(paragraph: &impl text::Paragraph) -> alignment::Horizonta
         alignment::Horizontal::Right
     } else {
         alignment::Horizontal::Left
+    }
+}
+
+use iced_core::widget::tree::Tree as WidgetTree;
+
+impl<Message: Clone + 'static> iced_core::widget::text::HasSelectableText
+    for TextInput<'_, Message>
+{
+    fn selected_text(&self, tree: &WidgetTree) -> Option<String> {
+        let state = tree.state.downcast_ref::<State>();
+        let (start, end) = state.cursor().selection(&state.tracked_value)?;
+        Some(state.tracked_value.select(start, end).to_string())
+    }
+
+    fn select_all(&self, tree: &mut WidgetTree) {
+        let state = tree.state.downcast_mut::<State>();
+        state.select_all();
+    }
+
+    fn is_editable(&self) -> bool {
+        true
+    }
+
+    fn has_text(&self, tree: &WidgetTree) -> bool {
+        !tree.state.downcast_ref::<State>().tracked_value.is_empty()
+    }
+
+    fn clipboard_has_text(&self, tree: &WidgetTree) -> bool {
+        tree.state.downcast_ref::<State>().clipboard_has_text
+    }
+
+    fn is_focused(&self, tree: &WidgetTree) -> bool {
+        tree.state.downcast_ref::<State>().is_focused()
+    }
+
+    fn context_menu_position(&self, tree: &WidgetTree) -> Option<iced_core::Point> {
+        tree.state.downcast_ref::<State>().context_menu_position
+    }
+
+    fn set_context_menu_position(&self, tree: &mut WidgetTree, pos: Option<iced_core::Point>) {
+        tree.state.downcast_mut::<State>().context_menu_position = pos;
+    }
+
+    fn delete_selection(&self, tree: &mut WidgetTree) -> Option<String> {
+        let state = tree.state.downcast_mut::<State>();
+        Some(state.delete_selection())
+    }
+
+    fn paste_text(&self, tree: &mut WidgetTree, text: &str) -> Option<String> {
+        let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
+        let state = tree.state.downcast_mut::<State>();
+        Some(state.paste_text(&filtered))
     }
 }

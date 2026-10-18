@@ -366,7 +366,8 @@ where
 
                     let mut current_offset = 0.0;
 
-                    let previous_hover_option = self.hovered_option.take();
+                    let previous_hover_option = self.hovered_option.clone();
+                    *self.hovered_option = None;
 
                     for (element, elem_height) in self.options.elements().zip(heights) {
                         let bounds = Rectangle {
@@ -377,25 +378,32 @@ where
                         };
 
                         if bounds.contains(cursor_position) {
-                            *self.hovered_option = if let OptionElement::Option((_, item)) = element
-                            {
-                                if previous_hover_option.as_ref() == Some(item) {
-                                    previous_hover_option
-                                } else {
+                            if let OptionElement::Option((_, item)) = element {
+                                *self.hovered_option = Some(item.clone());
+                                if previous_hover_option.as_ref() != Some(item) {
                                     if let Some(on_option_hovered) = self.on_option_hovered {
                                         shell.publish(on_option_hovered(item.clone()));
                                     }
-
-                                    Some(item.clone())
                                 }
-                            } else {
-                                None
-                            };
+                            }
 
                             break;
                         }
                         current_offset += elem_height;
                     }
+
+                    if *self.hovered_option != previous_hover_option {
+                        shell.request_redraw();
+                    }
+                } else if self.hovered_option.is_some() {
+                    *self.hovered_option = None;
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                if self.hovered_option.is_some() {
+                    *self.hovered_option = None;
+                    shell.request_redraw();
                 }
             }
             Event::Touch(touch::Event::FingerPressed { .. }) => {

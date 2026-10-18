@@ -55,12 +55,13 @@ where
     #[setters(strip_option)]
     font: Option<crate::font::Font>,
     #[setters(skip)]
-    on_surface_action: Option<Arc<dyn Fn(surface::Action) -> Message + Send + Sync + 'static>>,
+    on_surface_action:
+        Option<Arc<dyn Fn(surface::Action<AppMessage>) -> Message + Send + Sync + 'static>>,
     #[setters(skip)]
     action_map: Option<Arc<dyn Fn(Message) -> AppMessage + 'static + Send + Sync>>,
     #[setters(strip_option)]
     window_id: Option<window::Id>,
-    #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner,
 }
 
@@ -96,20 +97,20 @@ where
             text_line_height: text::LineHeight::Relative(1.2),
             font: None,
             window_id: None,
-            #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+            #[cfg(wayland_platform)]
             positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner::default(),
             on_surface_action: None,
             action_map: None,
         }
     }
 
-    #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     /// Handle dropdown requests for popup creation.
     /// Intended to be used with [`crate::app::message::get_popup`]
     pub fn with_popup<NewAppMessage>(
         self,
         parent_id: window::Id,
-        on_surface_action: impl Fn(surface::Action) -> Message + Send + Sync + 'static,
+        on_surface_action: impl Fn(surface::Action<NewAppMessage>) -> Message + Send + Sync + 'static,
         action_map: impl Fn(Message) -> NewAppMessage + Send + Sync + 'static,
     ) -> Dropdown<'a, S, Message, NewAppMessage> {
         let Self {
@@ -154,7 +155,7 @@ where
         self
     }
 
-    #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     pub fn with_positioner(
         mut self,
         positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner,
@@ -268,7 +269,7 @@ where
             layout,
             cursor,
             shell,
-            #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+            #[cfg(wayland_platform)]
             self.positioner.clone(),
             self.on_selected.clone(),
             self.selected,
@@ -346,7 +347,7 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
-        #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         if self.window_id.is_some() || self.on_surface_action.is_some() {
             return None;
         }
@@ -545,14 +546,16 @@ pub fn update<
     layout: Layout<'_>,
     cursor: mouse::Cursor,
     shell: &mut Shell<'_, Message>,
-    #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     positioner: iced_runtime::platform_specific::wayland::popup::SctkPositioner,
     on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync + 'static>,
     selected: Option<usize>,
     selections: &[S],
     state: impl FnOnce() -> &'a mut State,
     _window_id: Option<window::Id>,
-    on_surface_action: Option<Arc<dyn Fn(surface::Action) -> Message + Send + Sync + 'static>>,
+    on_surface_action: Option<
+        Arc<dyn Fn(surface::Action<AppMessage>) -> Message + Send + Sync + 'static>,
+    >,
     action_map: Option<Arc<dyn Fn(Message) -> AppMessage + Send + Sync + 'static>>,
     icons: &[icon::Handle],
     gap: f32,
@@ -567,11 +570,12 @@ pub fn update<
                 state: &mut State,
                 on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync + 'static>| {
         state.is_open.store(true, Ordering::Relaxed);
+        shell.request_redraw();
         let mut hovered_guard = state.hovered_option.lock().unwrap();
         *hovered_guard = selected;
         let id = window::Id::unique();
         state.popup_id = id;
-        #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         if let Some(((on_surface_action, parent), action_map)) = on_surface_action
             .as_ref()
             .zip(_window_id)
@@ -580,6 +584,8 @@ pub fn update<
             use iced_runtime::platform_specific::wayland::popup::{
                 SctkPopupSettings, SctkPositioner,
             };
+
+            use crate::surface::action::LiveSettings;
             let bounds = layout.bounds();
             let anchor_rect = Rectangle {
                 x: bounds.x as i32,
@@ -606,6 +612,7 @@ pub fn update<
             let on_surface_action_clone = on_surface_action.clone();
             let translation = layout.virtual_offset();
             let get_popup_action = surface::action::simple_popup::<AppMessage>(
+                || LiveSettings::default(),
                 move || {
                     SctkPopupSettings {
                 parent,
@@ -623,7 +630,7 @@ pub fn update<
                     ..Default::default()
                 },
                 parent_size: None,
-                grab: true,
+                grab: false,
                 close_with_children: true,
             }
                 },
@@ -658,7 +665,8 @@ pub fn update<
         state.close_operation = false;
         state.is_open.store(false, Ordering::SeqCst);
         if is_open {
-            #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+            shell.request_redraw();
+            #[cfg(wayland_platform)]
             if let Some(ref on_close) = on_surface_action {
                 shell.publish(on_close(surface::action::destroy_popup(state.popup_id)));
             }
@@ -681,7 +689,8 @@ pub fn update<
                 // Event wasn't processed by overlay, so cursor was clicked either outside it's
                 // bounds or on the drop-down, either way we close the overlay.
                 state.is_open.store(false, Ordering::Relaxed);
-                #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+                shell.request_redraw();
+                #[cfg(wayland_platform)]
                 if let Some(on_close) = on_surface_action {
                     shell.publish(on_close(surface::action::destroy_popup(state.popup_id)));
                 }
@@ -709,6 +718,22 @@ pub fn update<
         Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
             state.keyboard_modifiers = *modifiers;
         }
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            ..
+        }) => {
+            let is_open = state.is_open.load(Ordering::Relaxed);
+            if is_open {
+                state.is_open.store(false, Ordering::Relaxed);
+                shell.request_redraw();
+                #[cfg(wayland_platform)]
+                if let Some(on_close) = on_surface_action {
+                    shell.publish(on_close(surface::action::destroy_popup(state.popup_id)));
+                }
+                shell.capture_event();
+            }
+        }
+
         _ => {}
     }
 }
@@ -726,7 +751,7 @@ pub fn mouse_interaction(layout: Layout<'_>, cursor: mouse::Cursor) -> mouse::In
     }
 }
 
-#[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+#[cfg(wayland_platform)]
 /// Returns the current menu widget of a [`Dropdown`].
 #[allow(clippy::too_many_arguments)]
 pub fn menu_widget<

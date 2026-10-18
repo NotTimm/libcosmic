@@ -84,7 +84,7 @@
 //!
 //! Every application model requires a [cosmic::Core](app::Core). This contains
 //! application state which is managed by libcosmic's runtime for its generated
-//! interfaces. Such as the context drawner, nav bar, and the headerbar. This can be
+//! interfaces. Such as the context drawer, nav bar, and the headerbar. This can be
 //! used by the app to subscribe to configuration changes and to emit events to the
 //! libcosmic-managed portion of the application's state and view.
 
@@ -136,7 +136,7 @@ pub use dbus_activation::DbusActivation;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 
-#[cfg(any(feature = "xdg-portal", feature = "rfd"))]
+#[cfg(any(xdg_portal, feature = "rfd"))]
 pub mod dialog;
 
 pub mod executor;
@@ -162,7 +162,7 @@ pub(crate) mod malloc;
 pub mod process;
 
 #[doc(inline)]
-#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[cfg(wayland_platform)]
 pub use cctk;
 
 pub mod surface;

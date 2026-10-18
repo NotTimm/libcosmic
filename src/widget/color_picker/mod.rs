@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::Element;
-use crate::theme::{Button, THEME, Theme, iced::Slider};
+use crate::theme::iced::Slider;
+use crate::theme::{Button, THEME, Theme};
 use crate::widget::button::Catalog;
 use crate::widget::segmented_button::Entity;
 use crate::widget::{container, slider};
@@ -359,7 +360,9 @@ where
             })
             .step(4.0 / 17.0)
             .shift_step(64.0 / 17.0)
-            .width(self.width),
+            .width(self.width)
+            .handle_height(16)
+            .handle_width(16),
             text_input("", self.input_color)
                 .on_input(move |s| on_update(ColorPickerUpdate::Input(s)))
                 .on_paste(move |s| on_update(ColorPickerUpdate::Input(s)))
@@ -754,6 +757,23 @@ where
 
     fn size(&self) -> Size<Length> {
         Size::new(self.width, Length::Shrink)
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &crate::Renderer,
+    ) -> mouse::Interaction {
+        self.inner.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 }
 

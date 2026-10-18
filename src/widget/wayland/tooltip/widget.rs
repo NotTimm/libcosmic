@@ -13,24 +13,19 @@ use std::time::Duration;
 use iced::Task;
 use iced_runtime::core::widget::Id;
 
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::widget::Operation;
 use iced_core::widget::tree::{self, Tree};
 use iced_core::{
     Background, Border, Clipboard, Color, Layout, Length, Padding, Point, Rectangle, Shadow, Shell,
-    Vector, Widget, layout, mouse, overlay, renderer, svg, touch,
+    Vector, Widget, layout, mouse, overlay, renderer, touch,
 };
+use iced_runtime::platform_specific::wayland::CornerRadius;
+
+use crate::surface::action::LiveSettings;
+use crate::theme::THEME;
 
 pub use super::{Catalog, Style};
-
-/// Internally defines different button widget variants.
-enum Variant<Message> {
-    Normal,
-    Image {
-        close_icon: svg::Handle,
-        on_remove: Option<Message>,
-    },
-}
 
 /// A generic button which emits a message when pressed.
 #[allow(missing_debug_implementations)]
@@ -45,7 +40,7 @@ pub struct Tooltip<'a, Message, TopLevelMessage> {
     label: Option<Vec<iced_accessibility::accesskit::NodeId>>,
     content: crate::Element<'a, Message>,
     on_leave: Message,
-    on_surface_action: Box<dyn Fn(crate::surface::Action) -> Message>,
+    on_surface_action: Box<dyn Fn(crate::surface::Action<TopLevelMessage>) -> Message>,
     width: Length,
     height: Length,
     padding: Padding,
@@ -80,7 +75,7 @@ impl<'a, Message, TopLevelMessage> Tooltip<'a, Message, TopLevelMessage> {
         + Sync
         + 'static,
         on_leave: Message,
-        on_surface_action: impl Fn(crate::surface::Action) -> Message + 'static,
+        on_surface_action: impl Fn(crate::surface::Action<TopLevelMessage>) -> Message + 'static,
     ) -> Self {
         Self {
             id: Id::unique(),
@@ -306,8 +301,6 @@ impl<'a, Message: 'static + Clone, TopLevelMessage: 'static + Clone>
         }
         let content_layout = layout.children().next().unwrap();
 
-        let state = tree.state.downcast_ref::<State>();
-
         let styling = theme.style(&self.style);
 
         let icon_color = styling.icon_color.unwrap_or(renderer_style.icon_color);
@@ -447,7 +440,7 @@ pub fn update<'a, Message: Clone + 'static, TopLevelMessage: Clone + 'static>(
     >,
     delay: Option<Duration>,
     on_leave: &Message,
-    on_surface_action: &dyn Fn(crate::surface::Action) -> Message,
+    on_surface_action: &dyn Fn(crate::surface::Action<TopLevelMessage>) -> Message,
     state: impl FnOnce() -> &'a mut State,
 ) {
     match event {
@@ -521,21 +514,28 @@ pub fn update<'a, Message: Clone + 'static, TopLevelMessage: Clone + 'static>(
                                     > = Box::new(move || s(bounds));
                                     let boxed: Box<dyn Any + Send + Sync + 'static> =
                                         Box::new(boxed);
+
+                                    let theme = THEME.lock().unwrap();
+
+                                    let corners = theme.cosmic().corner_radii.radius_s;
+                                    let boxed_live: Box<
+                                        dyn Fn() -> LiveSettings + Send + Sync + 'static,
+                                    > = Box::new(move || LiveSettings {
+                                        corners: Some(CornerRadius {
+                                            top_left: corners[0] as u32,
+                                            top_right: corners[1] as u32,
+                                            bottom_left: corners[3] as u32,
+                                            bottom_right: corners[2] as u32,
+                                        }),
+                                        ..Default::default()
+                                    });
+                                    let boxed_live: Box<dyn Any + Send + Sync + 'static> =
+                                        Box::new(boxed_live);
                                     crate::surface::Action::Popup(
                                         Arc::new(boxed),
-                                        Some({
-                                            let boxed: Box<
-                                                dyn Fn() -> crate::Element<
-                                                        'static,
-                                                        crate::Action<TopLevelMessage>,
-                                                    > + Send
-                                                    + Sync
-                                                    + 'static,
-                                            > = Box::new(move || view());
-                                            let boxed: Box<dyn Any + Send + Sync + 'static> =
-                                                Box::new(boxed);
-                                            Arc::new(boxed)
-                                        }),
+                                        Arc::new(boxed_live),
+                                        Some(Arc::new(move || view())
+                                            as crate::surface::View<TopLevelMessage>),
                                     )
                                 })
                             }));
@@ -553,22 +553,27 @@ pub fn update<'a, Message: Clone + 'static, TopLevelMessage: Clone + 'static>(
                                     + 'static,
                             > = Box::new(move || s(bounds));
                             let boxed: Box<dyn Any + Send + Sync + 'static> = Box::new(boxed);
+                            let theme = THEME.lock().unwrap();
+
+                            let corners = theme.cosmic().corner_radii.radius_s;
+                            let boxed_live: Box<dyn Fn() -> LiveSettings + Send + Sync + 'static> =
+                                Box::new(move || LiveSettings {
+                                    corners: Some(CornerRadius {
+                                        top_left: corners[0] as u32,
+                                        top_right: corners[1] as u32,
+                                        bottom_left: corners[3] as u32,
+                                        bottom_right: corners[2] as u32,
+                                    }),
+                                    ..Default::default()
+                                });
+                            let boxed_live: Box<dyn Any + Send + Sync + 'static> =
+                                Box::new(boxed_live);
 
                             let sm = crate::surface::Action::Popup(
                                 Arc::new(boxed),
-                                Some({
-                                    let boxed: Box<
-                                        dyn Fn() -> crate::Element<
-                                                'static,
-                                                crate::Action<TopLevelMessage>,
-                                            > + Send
-                                            + Sync
-                                            + 'static,
-                                    > = Box::new(move || view());
-                                    let boxed: Box<dyn Any + Send + Sync + 'static> =
-                                        Box::new(boxed);
-                                    Arc::new(boxed)
-                                }),
+                                Arc::new(boxed_live),
+                                Some(Arc::new(move || view())
+                                    as crate::surface::View<TopLevelMessage>),
                             );
                             shell.publish((on_surface_action)(sm));
                         }

@@ -1,6 +1,8 @@
 #[cfg(not(windows))]
 pub use freedesktop_desktop_entry as fde;
 #[cfg(not(windows))]
+pub mod gpu;
+#[cfg(not(windows))]
 pub use mime::Mime;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
@@ -77,9 +79,12 @@ impl DesktopEntryCache {
     }
 
     pub fn refresh(&mut self) {
-        self.entries = fde::Iter::new(fde::default_paths())
-            .filter_map(|p| fde::DesktopEntry::from_path(p, Some(&self.locales)).ok())
-            .collect();
+        self.entries = desktop_entries_with_precedence(
+            fde::Iter::new(fde::default_paths())
+                .filter_map(|p| fde::DesktopEntry::from_path(p, Some(&self.locales)).ok()),
+        )
+        .filter(|entry| !entry.hidden())
+        .collect();
     }
 
     pub fn insert(&mut self, entry: fde::DesktopEntry) {
@@ -173,53 +178,58 @@ pub fn resolve_desktop_entry(
     options: &DesktopResolveOptions,
 ) -> fde::DesktopEntry {
     let app_id = fde::unicase::Ascii::new(context.app_id.as_ref());
+    let resolve = |cache: &mut DesktopEntryCache| {
+        if let Some(entry) = fde::find_app_by_id(cache.entries(), app_id) {
+            return Some(entry.clone());
+        }
 
-    if let Some(entry) = fde::find_app_by_id(cache.entries(), app_id) {
+        let candidate_ids = candidate_desktop_ids(context);
+
+        if let Some(entry) = try_match_cached(cache.entries(), &candidate_ids) {
+            return Some(entry);
+        }
+
+        if let Some(entry) = load_entry_via_app_ids(
+            cache,
+            &candidate_ids,
+            options.include_no_display,
+            options.xdg_current_desktop.as_deref(),
+        ) {
+            cache.insert(entry.clone());
+            return Some(entry);
+        }
+
+        if let Some(entry) = match_startup_wm_class(cache.entries(), context) {
+            return Some(entry);
+        }
+
+        // Chromium/CRX heuristic: scan exec/wmclass/icon for a CRX id match.
+        if let Some(entry) = match_crx_id(cache.entries(), context) {
+            return Some(entry);
+        }
+
+        if let Some(entry) = match_exec_basename(cache.entries(), &candidate_ids) {
+            return Some(entry);
+        }
+
+        if let Some(entry) = proton_or_wine_fallback(cache, context) {
+            cache.insert(entry.clone());
+            return Some(entry);
+        }
+
+        None
+    };
+
+    if let Some(entry) = resolve(cache) {
         return entry.clone();
     }
 
     cache.refresh();
-    if let Some(entry) = fde::find_app_by_id(cache.entries(), app_id) {
-        return entry.clone();
-    }
-
-    let candidate_ids = candidate_desktop_ids(context);
-
-    if let Some(entry) = try_match_cached(cache.entries(), &candidate_ids) {
-        return entry;
-    }
-
-    if let Some(entry) = load_entry_via_app_ids(
-        cache,
-        &candidate_ids,
-        options.include_no_display,
-        options.xdg_current_desktop.as_deref(),
-    ) {
-        cache.insert(entry.clone());
-        return entry;
-    }
-
-    if let Some(entry) = match_startup_wm_class(cache.entries(), context) {
-        return entry;
-    }
-
-    // Chromium/CRX heuristic: scan exec/wmclass/icon for a CRX id match.
-    if let Some(entry) = match_crx_id(cache.entries(), context) {
-        return entry;
-    }
-
-    if let Some(entry) = match_exec_basename(cache.entries(), &candidate_ids) {
-        return entry;
-    }
-
-    if let Some(entry) = proton_or_wine_fallback(cache, context) {
-        cache.insert(entry.clone());
-        entry
-    } else {
+    resolve(cache).unwrap_or_else(|| {
         let fallback = fallback_entry(context);
         cache.insert(fallback.clone());
         fallback
-    }
+    })
 }
 
 #[cfg(not(windows))]
@@ -605,27 +615,35 @@ fn candidate_desktop_ids(context: &DesktopLookupContext<'_>) -> Vec<String> {
 }
 
 #[cfg(not(windows))]
+fn desktop_entries_with_precedence<'a>(
+    entries: impl Iterator<Item = fde::DesktopEntry> + 'a,
+) -> impl Iterator<Item = fde::DesktopEntry> + 'a {
+    let mut seen = HashSet::new();
+
+    entries.filter(move |entry| seen.insert(entry.id().to_owned()))
+}
+
+#[cfg(not(windows))]
 pub fn load_applications<'a>(
     locales: &'a [String],
     include_no_display: bool,
     only_show_in: Option<&'a str>,
 ) -> impl Iterator<Item = DesktopEntryData> + 'a {
-    fde::Iter::new(fde::default_paths())
-        .filter_map(move |p| fde::DesktopEntry::from_path(p, Some(locales)).ok())
-        .filter(move |de| {
-            (include_no_display || !de.no_display())
-                && only_show_in.zip(de.only_show_in()).is_none_or(
-                    |(xdg_current_desktop, only_show_in)| {
-                        only_show_in.contains(&xdg_current_desktop)
-                    },
-                )
-                && only_show_in.zip(de.not_show_in()).is_none_or(
-                    |(xdg_current_desktop, not_show_in)| {
-                        !not_show_in.contains(&xdg_current_desktop)
-                    },
-                )
-        })
-        .map(move |de| DesktopEntryData::from_desktop_entry(locales, de))
+    desktop_entries_with_precedence(
+        fde::Iter::new(fde::default_paths())
+            .filter_map(move |p| fde::DesktopEntry::from_path(p, Some(locales)).ok()),
+    )
+    .filter(move |de| {
+        !de.hidden()
+            && (include_no_display || !de.no_display())
+            && only_show_in.zip(de.only_show_in()).is_none_or(
+                |(xdg_current_desktop, only_show_in)| only_show_in.contains(&xdg_current_desktop),
+            )
+            && only_show_in.zip(de.not_show_in()).is_none_or(
+                |(xdg_current_desktop, not_show_in)| !not_show_in.contains(&xdg_current_desktop),
+            )
+    })
+    .map(move |de| DesktopEntryData::from_desktop_entry(locales, de))
 }
 
 // Create an iterator which filters desktop entries by app IDs.
@@ -642,40 +660,51 @@ pub fn load_applications_for_app_ids<'a>(
     let app_ids = std::rc::Rc::new(std::cell::RefCell::new(app_ids));
     let app_ids_ = app_ids.clone();
 
-    let applications = iter
+    let applications = desktop_entries_with_precedence(iter)
         .filter(move |de| {
+            // Match and consume the requested ID before applying visibility
+            // filters. This prevents a Hidden or NoDisplay override from being
+            // recreated by fill_missing_ones.
+            let position = {
+                let requested = app_ids.borrow();
+
+                requested
+                    .iter()
+                    .position(|id| de.matches_id(fde::unicase::Ascii::new(*id)))
+                    .or_else(|| {
+                        requested
+                            .iter()
+                            .position(|id| de.matches_name(fde::unicase::Ascii::new(*id)))
+                    })
+            };
+
+            let Some(position) = position else {
+                return false;
+            };
+
+            app_ids.borrow_mut().remove(position);
+
+            if de.hidden() {
+                return false;
+            }
+
             if !include_no_display && de.no_display() {
                 return false;
             }
+
             if only_show_in.zip(de.only_show_in()).is_some_and(
                 |(xdg_current_desktop, only_show_in)| !only_show_in.contains(&xdg_current_desktop),
             ) {
                 return false;
             }
+
             if only_show_in.zip(de.not_show_in()).is_some_and(
                 |(xdg_current_desktop, not_show_in)| not_show_in.contains(&xdg_current_desktop),
             ) {
                 return false;
             }
 
-            // Search by ID first
-            app_ids
-                .borrow()
-                .iter()
-                .position(|id| de.matches_id(fde::unicase::Ascii::new(*id)))
-                // Then fall back to search by name
-                .or_else(|| {
-                    app_ids
-                        .borrow()
-                        .iter()
-                        .position(|id| de.matches_name(fde::unicase::Ascii::new(*id)))
-                })
-                // Remove the app ID if found
-                .map(|i| {
-                    app_ids.borrow_mut().remove(i);
-                    true
-                })
-                .unwrap_or_default()
+            true
         })
         .map(move |de| DesktopEntryData::from_desktop_entry(locales, de));
 
@@ -912,6 +941,174 @@ mod tests {
     }
 
     #[test]
+    fn desktop_entry_precedence_prefers_first_entry() {
+        let locales = vec!["en_US.UTF-8".to_string()];
+
+        let user_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=User Application\n\
+         Exec=user-application\n",
+            &locales,
+        );
+
+        let system_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=System Application\n\
+         Exec=system-application\n",
+            &locales,
+        );
+
+        let entries = desktop_entries_with_precedence(vec![user_entry, system_entry].into_iter())
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].exec(), Some("user-application"));
+    }
+
+    #[test]
+    fn hidden_override_masks_system_entry_without_fallback() {
+        let locales = vec!["en_US.UTF-8".to_string()];
+
+        let user_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Example Application\n\
+         Hidden=true\n",
+            &locales,
+        );
+
+        let system_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Example Application\n\
+         Exec=system-application\n",
+            &locales,
+        );
+
+        let applications = load_applications_for_app_ids(
+            vec![user_entry, system_entry].into_iter(),
+            &locales,
+            vec!["com.example.App"],
+            true,
+            false,
+            Some("COSMIC"),
+        )
+        .collect::<Vec<_>>();
+
+        assert!(applications.is_empty());
+    }
+
+    #[test]
+    fn no_display_override_masks_system_entry() {
+        let locales = vec!["en_US.UTF-8".to_string()];
+
+        let user_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=User Application\n\
+         Exec=user-application\n\
+         NoDisplay=true\n",
+            &locales,
+        );
+
+        let system_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=System Application\n\
+         Exec=system-application\n",
+            &locales,
+        );
+
+        let hidden_from_menu = load_applications_for_app_ids(
+            vec![user_entry.clone(), system_entry.clone()].into_iter(),
+            &locales,
+            vec!["com.example.App"],
+            true,
+            false,
+            Some("COSMIC"),
+        )
+        .collect::<Vec<_>>();
+
+        assert!(hidden_from_menu.is_empty());
+
+        let included_when_requested = load_applications_for_app_ids(
+            vec![user_entry, system_entry].into_iter(),
+            &locales,
+            vec!["com.example.App"],
+            true,
+            true,
+            Some("COSMIC"),
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(included_when_requested.len(), 1);
+        assert_eq!(
+            included_when_requested[0].exec.as_deref(),
+            Some("user-application")
+        );
+    }
+
+    #[test]
+    fn not_show_in_override_masks_system_entry_for_cosmic() {
+        let locales = vec!["en_US.UTF-8".to_string()];
+
+        let user_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=User Application\n\
+         Exec=user-application\n\
+         NotShowIn=COSMIC;\n",
+            &locales,
+        );
+
+        let system_entry = load_entry(
+            "com.example.App.desktop",
+            "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=System Application\n\
+         Exec=system-application\n",
+            &locales,
+        );
+
+        let hidden_in_cosmic = load_applications_for_app_ids(
+            vec![user_entry.clone(), system_entry.clone()].into_iter(),
+            &locales,
+            vec!["com.example.App"],
+            true,
+            false,
+            Some("COSMIC"),
+        )
+        .collect::<Vec<_>>();
+
+        assert!(hidden_in_cosmic.is_empty());
+
+        let visible_in_gnome = load_applications_for_app_ids(
+            vec![user_entry, system_entry].into_iter(),
+            &locales,
+            vec!["com.example.App"],
+            true,
+            false,
+            Some("GNOME"),
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(visible_in_gnome.len(), 1);
+        assert_eq!(
+            visible_in_gnome[0].exec.as_deref(),
+            Some("user-application")
+        );
+    }
+
+    #[test]
     fn candidate_generation_covers_common_variants() {
         let ctx = DesktopLookupContext::new("com.example.App.desktop")
             .with_identifier("com-example-App")
@@ -976,14 +1173,13 @@ StartupWMClass=crx_jnpecgipniidlgicjocehkhajgdnjekh
         let apps_dir = temp.path().join("applications");
         fs::create_dir_all(&apps_dir).expect("create applications dir");
 
-        let desktop_contents = "\
-[Desktop Entry]\n\
-Version=1.0\n\
-Type=Application\n\
-Name=VMware Workstation\n\
-Exec=/usr/bin/vmware %U\n\
-Icon=vmware-workstation\n\
-";
+        let desktop_contents = r#"[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VMware Workstation
+Exec=/usr/bin/vmware %U
+Icon=vmware-workstation
+"#;
         let desktop_path = apps_dir.join("vmware-workstation.desktop");
         fs::write(desktop_path, desktop_contents).expect("write desktop file");
 
@@ -1097,30 +1293,29 @@ Icon=vmware-workstation\n\
 
     #[test]
     fn crx_matcher_by_exec_and_wmclass() {
-        use std::fs;
-        let id = "cadlkienfkclaiaibeoongdcgmdikeeg";
-        let temp = tempdir().expect("tempdir");
-        let apps_dir = temp.path().join("applications");
-        fs::create_dir_all(&apps_dir).expect("create applications dir");
-        let desktop_contents = format!(
-            "[Desktop Entry]\nType=Application\nName=ChatGPT\nExec=chromium --app-id={} --profile-directory=Default\nStartupWMClass=crx_{}\nIcon=chrome-{}-Default\n",
-            id, id, id
-        );
-        let desktop_path = apps_dir.join(
-            "org.chromium.Chromium.flextop.chrome-cadlkienfkclaiaibeoongdcgmdikeeg-Default.desktop",
-        );
-        fs::write(&desktop_path, desktop_contents).expect("write desktop file");
-
-        let _guard = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
         let locales = vec!["en_US.UTF-8".to_string()];
+        let id = "cadlkienfkclaiaibeoongdcgmdikeeg";
         let mut cache = DesktopEntryCache::new(locales.clone());
-        cache.refresh();
+        cache.insert(fde::DesktopEntry::from_str(
+            "org.chromium.Chromium.flextop.chrome-cadlkienfkclaiaibeoongdcgmdikeeg-Default.desktop",
+            &format!(
+                r#"[Desktop Entry]
+Type=Application
+Name=Example
+Exec=chromium --app-id={id} --profile-directory=Default
+StartupWMClass=crx_{id}
+Icon=chrome-{id}-Default
+"#
+            ),
+            Some(&locales),
+        )
+        .unwrap());
 
         let short_id = format!("chrome-{}-Default", id);
         let ctx = DesktopLookupContext::new(short_id);
         let resolved = resolve_desktop_entry(&mut cache, &ctx, &DesktopResolveOptions::default());
-        assert!(resolved.icon().is_some());
         assert!(resolved.exec().is_some());
+        assert!(resolved.icon().is_some());
         let expected = format!("crx_{}", id);
         assert_eq!(resolved.startup_wm_class(), Some(expected.as_str()));
     }

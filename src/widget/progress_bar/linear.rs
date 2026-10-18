@@ -1,9 +1,9 @@
 //! Show a linear progress indicator.
 use super::animation::{Animation, Progress};
-use super::style::StyleSheet;
+use super::style::{self, Catalog};
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, renderer};
-use iced::{Element, Event, Length, Pixels, Rectangle, Size, mouse, window};
+use iced::{Border, Color, Element, Event, Length, Pixels, Rectangle, Size, mouse, window};
 
 use std::time::Duration;
 
@@ -13,11 +13,11 @@ const WRAP_LENGTH: f32 = 0.618; // avoids animation repetition
 #[must_use]
 pub struct Linear<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog,
 {
     width: Length,
     girth: Length,
-    style: Theme::Style,
+    class: Theme::Class,
     cycle_duration: Duration,
     period: Duration,
     progress: Option<f32>,
@@ -27,14 +27,14 @@ where
 
 impl<Theme> Linear<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog<Class = style::Class>,
 {
     /// Creates a new [`Linear`] with the given content.
     pub fn new() -> Self {
         Linear {
             width: Length::Fixed(100.0),
             girth: Length::Fixed(4.0),
-            style: Theme::Style::default(),
+            class: Theme::Class::default(),
             cycle_duration: Duration::from_millis(1500),
             period: Duration::from_secs(2),
             progress: None,
@@ -55,9 +55,9 @@ where
         self
     }
 
-    /// Sets the style variant of this [`Linear`].
-    pub fn style(mut self, style: impl Into<Theme::Style>) -> Self {
-        self.style = style.into();
+    /// Sets the style class of this [`Linear`].
+    pub fn class(mut self, class: Theme::Class) -> Self {
+        self.class = class;
         self
     }
 
@@ -99,11 +99,35 @@ where
         self.segment_spacing = spacing.into().0.max(1.0);
         self
     }
+
+    /// Sets the track color of this [`Linear`].
+    pub fn track_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.track_color(color);
+        self
+    }
+
+    /// Sets the bar color of this [`Linear`].
+    pub fn bar_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.bar_color(color);
+        self
+    }
+
+    /// Sets the border color of this [`Linear`].
+    pub fn border_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.border_color(color);
+        self
+    }
+
+    /// Sets the border radius of this [`Linear`].
+    pub fn border_radius(mut self, radius: f32) -> Self {
+        self.class = self.class.border_radius(radius);
+        self
+    }
 }
 
 impl<Theme> Default for Linear<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog<Class = style::Class>,
 {
     fn default() -> Self {
         Self::new()
@@ -119,7 +143,7 @@ struct State {
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Linear<Theme>
 where
     Message: Clone,
-    Theme: StyleSheet,
+    Theme: Catalog,
     Renderer: advanced::Renderer,
 {
     fn tag(&self) -> tree::Tag {
@@ -175,7 +199,6 @@ where
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn draw(
         &self,
         tree: &Tree,
@@ -187,7 +210,7 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let custom_style = theme.appearance(&self.style, self.progress.is_some(), false);
+        let custom_style = theme.style(&self.class, self.progress.is_some(), false);
         let state = tree.state.downcast_ref::<State>();
 
         let border_width = if custom_style.border_color.is_some() {
@@ -197,20 +220,13 @@ where
         };
         let border_color = custom_style.border_color.unwrap_or(custom_style.bar_color);
         let radius = custom_style.border_radius;
+        let track_color = custom_style.track_color;
+        let bar_color = custom_style.bar_color;
 
-        let draw_quad = |renderer: &mut Renderer,
-                         x: f32,
-                         width: f32,
-                         color: iced::Color,
-                         border: iced::Border| {
+        let draw_quad = |renderer: &mut Renderer, rect: Rectangle, border: Border, color: Color| {
             renderer.fill_quad(
                 renderer::Quad {
-                    bounds: Rectangle {
-                        x: bounds.x + x * bounds.width,
-                        y: bounds.y,
-                        width: width * bounds.width,
-                        height: bounds.height,
-                    },
+                    bounds: rect,
                     border,
                     snap: true,
                     ..renderer::Quad::default()
@@ -218,20 +234,21 @@ where
                 color,
             );
         };
+        let to_rect = |x: f32, width: f32| Rectangle {
+            x: bounds.x + x * bounds.width,
+            y: bounds.y,
+            width: width * bounds.width,
+            height: bounds.height,
+        };
 
         // determinate progress bar
         if self.progress.is_some() {
             let current_p = state.progress.current;
             let len = self.markers.len();
             let spacing = self.segment_spacing;
-            let radius_inner = radius.min(spacing);
-
-            let gap = if len != 0 {
-                spacing / bounds.width
-            } else {
-                0.0
-            };
+            let gap = spacing / bounds.width;
             let drawable = 1.0 - gap * len as f32;
+            let radius_inner = radius.min(spacing);
 
             for i in 0..=len {
                 let (seg_lo, r_left) = if i == 0 {
@@ -246,9 +263,10 @@ where
                 };
                 let x_start = seg_lo * drawable + i as f32 * gap;
                 let x_width = (seg_hi - seg_lo) * drawable;
+                let rect = to_rect(x_start, x_width);
                 let segment_radius = [r_left, r_right, r_right, r_left].into();
 
-                let border = iced::Border {
+                let border = Border {
                     width: border_width,
                     color: border_color,
                     radius: segment_radius,
@@ -256,27 +274,19 @@ where
 
                 // empty segment
                 if current_p < seg_lo {
-                    draw_quad(renderer, x_start, x_width, custom_style.track_color, border);
+                    draw_quad(renderer, rect, border, track_color);
                 }
                 // filled segment
                 else if current_p > seg_hi {
-                    draw_quad(renderer, x_start, x_width, custom_style.bar_color, border);
+                    draw_quad(renderer, rect, border, bar_color);
                 }
                 // partially filled segment
                 else {
-                    let fill = ((current_p - seg_lo) / (seg_hi - seg_lo)).min(1.0);
-                    draw_quad(renderer, x_start, x_width, custom_style.track_color, border);
-                    renderer.with_layer(
-                        Rectangle {
-                            x: bounds.x + x_start * bounds.width,
-                            y: bounds.y,
-                            width: x_width * bounds.width * fill,
-                            height: bounds.height,
-                        },
-                        |renderer| {
-                            draw_quad(renderer, x_start, x_width, custom_style.bar_color, border);
-                        },
-                    );
+                    let fill = (current_p - seg_lo) / (seg_hi - seg_lo);
+                    draw_quad(renderer, rect, border, track_color);
+                    renderer.with_layer(to_rect(x_start, x_width * fill), |renderer| {
+                        draw_quad(renderer, rect, border, bar_color);
+                    });
                 }
             }
         }
@@ -285,14 +295,13 @@ where
             // draw track
             draw_quad(
                 renderer,
-                0.0,
-                1.0,
-                custom_style.track_color,
-                iced::Border {
+                bounds,
+                Border {
                     width: border_width,
                     color: border_color,
                     radius: radius.into(),
                 },
+                track_color,
             );
 
             // draw bar
@@ -304,34 +313,17 @@ where
             let start = bar_start % 1.0;
             let right_width = (1.0 - start).min(length);
             let left_width = length - right_width;
-            let border = iced::Border {
+            let border = Border {
                 radius: radius.into(),
-                ..iced::Border::default()
+                ..Border::default()
             };
 
-            renderer.with_layer(
-                Rectangle {
-                    x: bounds.x,
-                    y: bounds.y,
-                    width: left_width * bounds.width,
-                    height: bounds.height,
-                },
-                |renderer| {
-                    draw_quad(renderer, 0.0, 1.0, custom_style.bar_color, border);
-                },
-            );
-
-            renderer.with_layer(
-                Rectangle {
-                    x: bounds.x + start * bounds.width,
-                    y: bounds.y,
-                    width: right_width * bounds.width,
-                    height: bounds.height,
-                },
-                |renderer| {
-                    draw_quad(renderer, 0.0, 1.0, custom_style.bar_color, border);
-                },
-            );
+            renderer.with_layer(to_rect(start, right_width), |renderer| {
+                draw_quad(renderer, bounds, border, bar_color);
+            });
+            renderer.with_layer(to_rect(0.0, left_width), |renderer| {
+                draw_quad(renderer, bounds, border, bar_color);
+            });
         }
     }
 }
@@ -339,7 +331,7 @@ where
 impl<'a, Message, Theme, Renderer> From<Linear<Theme>> for Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
-    Theme: StyleSheet + 'a,
+    Theme: Catalog + 'a,
     Renderer: iced::advanced::Renderer + 'a,
 {
     fn from(linear: Linear<Theme>) -> Self {

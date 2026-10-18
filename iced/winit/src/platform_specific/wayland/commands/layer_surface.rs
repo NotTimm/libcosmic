@@ -1,8 +1,9 @@
 //! Interact with the window of your application.
 
+use crate::core::Rectangle;
 use crate::core::window::Id as SurfaceId;
 use iced_runtime::{
-    self,
+    self, Action, Task,
     platform_specific::{
         self,
         wayland::{
@@ -10,7 +11,7 @@ use iced_runtime::{
             layer_surface::{IcedMargin, SctkLayerSurfaceSettings},
         },
     },
-    task, Action, Task,
+    task,
 };
 
 pub use cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
@@ -111,6 +112,40 @@ pub fn set_layer<Message>(id: SurfaceId, layer: Layer) -> Task<Message> {
     task::effect(Action::PlatformSpecific(
         platform_specific::Action::Wayland(wayland::Action::LayerSurface(
             wayland::layer_surface::Action::Layer { id, layer },
+        )),
+    ))
+}
+
+pub fn set_padding<Message>(
+    id: SurfaceId,
+    padding: IcedMargin,
+) -> Task<Message> {
+    task::effect(Action::PlatformSpecific(
+        platform_specific::Action::Wayland(wayland::Action::LayerSurface(
+            wayland::layer_surface::Action::Padding { id, padding },
+        )),
+    ))
+}
+
+/// <https://wayland.app/protocols/wayland#wl_surface:request:set_input_region>
+pub fn set_input_zone<Message>(
+    id: SurfaceId,
+    zone: Option<Vec<Rectangle>>,
+) -> Task<Message> {
+    task::effect(Action::PlatformSpecific(
+        platform_specific::Action::Wayland(wayland::Action::LayerSurface(
+            wayland::layer_surface::Action::InputZone { id, zone },
+        )),
+    ))
+}
+
+pub fn set_show_on_lock<Message>(
+    id: SurfaceId,
+    value: bool,
+) -> Task<Message> {
+    task::effect(Action::PlatformSpecific(
+        platform_specific::Action::Wayland(wayland::Action::LayerSurface(
+            wayland::layer_surface::Action::ShowOnLock { id, value },
         )),
     ))
 }

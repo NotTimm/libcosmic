@@ -23,6 +23,33 @@ use winit::event::Force;
 use winit::icon::IconProvider;
 use winit::keyboard::SmolStr;
 
+/// Returns the activation token provided by the compositor, if any.
+///
+/// The token is single-use, so it is only ever handed out to the first window.
+#[cfg(target_os = "linux")]
+fn take_activation_token() -> Option<winit::window::ActivationToken> {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use winit::platform::startup_notify::reset_activation_token_env;
+
+    static TOKEN: OnceLock<Mutex<Option<winit::window::ActivationToken>>> =
+        OnceLock::new();
+
+    TOKEN
+        .get_or_init(|| {
+            let token = std::env::var("XDG_ACTIVATION_TOKEN")
+                .ok()
+                .map(winit::window::ActivationToken::from_raw);
+
+            reset_activation_token_env();
+
+            Mutex::new(token)
+        })
+        .lock()
+        .ok()
+        .and_then(|mut token| token.take())
+}
+
 /// Converts some [`window::Settings`] into some `WindowAttributes` from `winit`.
 pub fn window_attributes(
     settings: window::Settings,
@@ -182,12 +209,19 @@ pub fn window_attributes(
         {
             use winit::platform::wayland::WindowAttributesWayland;
 
-            attributes = attributes.with_platform_attributes(Box::new(
-                WindowAttributesWayland::default().with_name(
+            let mut wayland_attributes = WindowAttributesWayland::default()
+                .with_name(
                     &settings.platform_specific.application_id,
                     &settings.platform_specific.application_id,
-                ),
-            ));
+                );
+
+            if let Some(token) = take_activation_token() {
+                wayland_attributes =
+                    wayland_attributes.with_activation_token(token);
+            }
+
+            attributes = attributes
+                .with_platform_attributes(Box::new(wayland_attributes));
         }
     }
 
@@ -235,6 +269,13 @@ pub fn window_event(
                     scale_factor,
                 )))
             }
+            winit::event::PointerSource::TabletTool { .. } => {
+                let position = position.to_logical::<f64>(scale_factor);
+
+                Some(Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(position.x as f32, position.y as f32),
+                }))
+            }
             _ => None,
         },
         // TODO how to handle this for Touch? Is it different than a press? Need to double check winit impl
@@ -271,6 +312,24 @@ pub fn window_event(
                     mouse::Event::ButtonReleased(button)
                 }
             }))
+        }
+        WindowEvent::PointerButton {
+            button: ButtonSource::TabletTool { button, .. },
+            state,
+            ..
+        } => {
+            let button: Option<winit::event::MouseButton> = button.into();
+
+            button.map(mouse_button).map(|button| {
+                Event::Mouse(match state {
+                    winit::event::ElementState::Pressed => {
+                        mouse::Event::ButtonPressed(button)
+                    }
+                    winit::event::ElementState::Released => {
+                        mouse::Event::ButtonReleased(button)
+                    }
+                })
+            })
         }
         WindowEvent::PointerButton {
             button: ButtonSource::Touch { finger_id, force },
@@ -430,7 +489,7 @@ pub fn window_event(
         WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
             Some(Event::Window(window::Event::Rescaled(scale_factor as f32)))
         }
-        #[cfg(all(feature = "cctk", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         WindowEvent::SuggestedBounds(bounds) => {
             let size = bounds.map(|bounds| {
                 let size = bounds.to_logical(scale_factor);
@@ -443,7 +502,7 @@ pub fn window_event(
                 ),
             )))
         }
-        #[cfg(all(feature = "cctk", target_os = "linux"))]
+        #[cfg(wayland_platform)]
         WindowEvent::WindowStateChanged => {
             use cctk::sctk::reexports::csd_frame::WindowState;
             use winit::platform::wayland::WindowExtWayland;
@@ -1497,7 +1556,7 @@ pub fn winit_key_code(
     })
 }
 
-#[cfg(all(feature = "cctk", target_os = "linux"))]
+#[cfg(wayland_platform)]
 fn winit_native_key_code(
     keycode: keyboard::key::NativeCode,
 ) -> winit::keyboard::NativeKeyCode {
@@ -1521,7 +1580,7 @@ fn winit_native_key_code(
 }
 
 /// Reconstruct the raw keycode
-#[cfg(all(feature = "cctk", target_os = "linux"))]
+#[cfg(wayland_platform)]
 pub fn physical_to_scancode(physical: keyboard::key::Physical) -> Option<u32> {
     let Some(physical_key) = (match physical {
         keyboard::key::Physical::Code(code) => {

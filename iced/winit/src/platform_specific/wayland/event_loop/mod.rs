@@ -1,4 +1,5 @@
 pub mod control_flow;
+pub mod popup;
 pub mod proxy;
 pub mod state;
 
@@ -6,6 +7,7 @@ pub mod state;
 use crate::platform_specific::SurfaceIdWrapper;
 use crate::{
     Control,
+    event_loop::popup::PopupManager,
     futures::futures::channel::mpsc,
     handlers::{
         ext_background_effect, overlap::OverlapNotifyV1,
@@ -33,7 +35,7 @@ use cctk::{
         reexports::{
             calloop::{self, EventLoop},
             client::{
-                ConnectError, Connection, Proxy, globals::registry_queue_init,
+                Connection, Proxy, globals::registry_queue_init,
             },
         },
         registry::RegistryState,
@@ -46,8 +48,6 @@ use cctk::{
 };
 use raw_window_handle::HasDisplayHandle;
 use state::{FrameStatus, SctkWindow, send_event};
-#[cfg(feature = "a11y")]
-use std::sync::{Arc, Mutex};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
@@ -71,8 +71,8 @@ pub struct SctkEventLoop {
     pub(crate) state: SctkState,
 }
 
+#[derive(Debug)]
 pub enum Error {
-    Connect(ConnectError),
     Calloop(calloop::Error),
     Global(GlobalError),
     NoDisplayHandle,
@@ -129,7 +129,7 @@ impl SctkEventLoop {
                             crate::platform_specific::Action::ResizeWindow(id) => {
                                 if let Some((_, v)) = state.windows.iter()
                                     .find(|w| w.id == id)
-                                    .map(|w| w.corner_radius.as_ref())
+                                    .map(|w| state.corner_radii.get(&id))
                                     .unwrap_or_default() {
                                     _ = state.handle_action(iced_runtime::platform_specific::wayland::Action::RoundedCorners(id, *v));
                                 }
@@ -138,7 +138,7 @@ impl SctkEventLoop {
                                 window,
                                 id,
                             ) => {
-                                state.windows.push(SctkWindow { window, id, corner_radius: Default::default() });
+                                state.windows.push(SctkWindow { window, id });
                                 if let Some(v) = state.pending_corner_radius.remove(&id) {
                                     _ = state.handle_action(iced_runtime::platform_specific::wayland::Action::RoundedCorners(id, Some(v)));
                                 }
@@ -179,11 +179,39 @@ impl SctkEventLoop {
                                 }
                             }
                             crate::platform_specific::Action::SetCursor(
+                                surface,
                                 icon,
                             ) => {
-                                if let Some(seat) = state.seats.get_mut(0) {
+                                state.record_cursor(surface.clone(), |r| {
+                                    r.icon = Some(icon);
+                                    r.hidden = false;
+                                });
+                                if let Some(seat) = state
+                                    .seats
+                                    .get_mut(0)
+                                    .filter(|s| s.is_over(&surface))
+                                {
                                     seat.icon = Some(icon);
+                                    seat.hidden = false;
                                     seat.set_cursor(&state.connection, icon);
+                                }
+                            }
+                            crate::platform_specific::Action::SetCursorVisible(
+                                surface,
+                                visible,
+                            ) => {
+                                state.record_cursor(surface.clone(), |r| {
+                                    r.hidden = !visible;
+                                });
+                                if let Some(seat) = state
+                                    .seats
+                                    .get_mut(0)
+                                    .filter(|s| s.is_over(&surface))
+                                {
+                                    seat.set_cursor_visible(
+                                        &state.connection,
+                                        visible,
+                                    );
                                 }
                             }
                             crate::platform_specific::Action::RequestRedraw(
@@ -350,7 +378,7 @@ impl SctkEventLoop {
                         ),
                         corner_radius_manager: registry_state.bind_one::<CosmicCornerRadiusManagerV1, _, _>(
                             &qh,
-                            1..=1,
+                            1..=2,
                             (),
                         ).ok(),
                         toplevel_manager: ToplevelManagerState::try_new(
@@ -364,6 +392,7 @@ impl SctkEventLoop {
                         ).ok(),
                         text_input_manager: TextInputManager::try_new(&registry_state, &qh),
                         ext_background_effect_manager: ext_background_effect::ExtBackgroundEffectManager::new(&globals, &qh).ok(),
+                        cosmic_session_lock_layer_manager: registry_state.bind_one(&qh, 1..=1, ()).ok(),
                         registry_state,
 
                         queue_handle: qh,
@@ -377,13 +406,16 @@ impl SctkEventLoop {
                         seats: Vec::new(),
                         windows: Vec::new(),
                         blur_surfaces: HashMap::new(),
+                        corner_radii: HashMap::new(),
                         layer_surfaces: Vec::new(),
-                        popups: Vec::new(),
+                        popmgr: PopupManager::default(),
                         lock_surfaces: Vec::new(),
                         subsurfaces: Vec::new(),
                         touch_points: HashMap::new(),
+                        kbd_leave_to_own_popup: HashSet::new(),
                         sctk_events: Vec::new(),
                         frame_status: HashMap::new(),
+                        cursor_requests: HashMap::new(),
                         fractional_scaling_manager,
                         viewporter_state,
                         compositor_updates: Default::default(),
@@ -402,6 +434,7 @@ impl SctkEventLoop {
                         preedit: None,
                         pending_delete: None,
                         pending_commit: None,
+                        pending_blur: HashMap::new(),
                     },
                     _features: Default::default(),
                 };
@@ -514,8 +547,8 @@ impl SctkEventLoop {
                             .chain(
                                 state
                                     .state
-                                    .popups
-                                    .iter()
+                                    .popmgr
+                                    .popups()
                                     .map(|s| s.popup.wl_surface()),
                             )
                             .chain(

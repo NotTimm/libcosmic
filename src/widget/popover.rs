@@ -24,6 +24,7 @@ pub enum Position {
     #[default]
     Center,
     Bottom,
+    Top,
     Point(Point),
 }
 
@@ -260,6 +261,7 @@ where
                 Position::Point(relative) => {
                     bounds.position() + Vector::new(relative.x, relative.y)
                 }
+                Position::Top => Point::new(bounds.x + bounds.width / 2.0, bounds.y),
             };
 
             // Round position to prevent rendering issues
@@ -354,6 +356,12 @@ where
                 position.x = (position.x - width / 2.0).clamp(0.0, bounds.width - width);
                 position.y = (position.y - height / 2.0).clamp(0.0, bounds.height - height);
             }
+            Position::Top => {
+                let width = node.size().width;
+                let height = node.size().height;
+                position.x = (position.x - width / 2.0).clamp(0.0, bounds.width - width);
+                position.y = (position.y - height).clamp(0.0, bounds.height - height);
+            }
             Position::Bottom => {
                 // Position is set to the center bottom of the widget
                 let width = node.size().width;
@@ -402,6 +410,26 @@ where
             && matches!(event, Event::Mouse(_) | Event::Touch(_))
             && !cursor_position.is_over(layout.bounds())
         {
+            // Swallow new presses outside the popup, but still forward other
+            // events so an interaction started inside it (such as a selection
+            // drag) receives its release once the cursor leaves the bounds.
+            let is_press = matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                    | Event::Touch(touch::Event::FingerPressed { .. })
+            );
+            if !is_press {
+                self.content.as_widget_mut().update(
+                    self.tree,
+                    event,
+                    layout,
+                    cursor_position,
+                    renderer,
+                    clipboard,
+                    shell,
+                    &layout.bounds(),
+                );
+            }
             shell.capture_event();
             return;
         }

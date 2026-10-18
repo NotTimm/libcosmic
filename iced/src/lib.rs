@@ -606,7 +606,7 @@ pub mod font {
 pub mod event {
     //! Handle events of a user interface.
     pub use crate::core::event::PlatformSpecific;
-    #[cfg(all(feature = "cctk", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     pub use crate::core::event::wayland;
     pub use crate::core::event::{Event, Status};
     pub use iced_futures::event::{listen, listen_raw, listen_with};
@@ -682,7 +682,9 @@ pub use error::Error;
 pub use event::Event;
 pub use executor::Executor;
 pub use font::Font;
-pub use renderer::{Renderer, graphics::geometry};
+pub use renderer::Renderer;
+#[cfg(feature = "canvas")]
+pub use renderer::graphics::geometry;
 pub use task::Task;
 pub use window::Window;
 

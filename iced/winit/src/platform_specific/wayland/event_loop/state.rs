@@ -1,9 +1,11 @@
 use crate::{
     Control,
+    event_loop::popup::{self, PopupManager},
     handlers::{
         activation::IcedRequestData,
         ext_background_effect,
         overlap::{OverlapNotificationV1, OverlapNotifyV1},
+        shell::corner_radius::CornerRadiusWrapper,
         text_input::{Preedit, TextInputManager},
     },
     platform_specific::{
@@ -40,17 +42,14 @@ use winit::{
 
 use cctk::{
     cosmic_protocols::{
-        corner_radius::v1::client::{
-            cosmic_corner_radius_manager_v1::CosmicCornerRadiusManagerV1,
-            cosmic_corner_radius_toplevel_v1::CosmicCornerRadiusToplevelV1,
-        },
+        corner_radius::v1::client::cosmic_corner_radius_manager_v1::CosmicCornerRadiusManagerV1,
         overlap_notify::v1::client::zcosmic_overlap_notification_v1::ZcosmicOverlapNotificationV1,
+        session_lock_layer::v1::client::cosmic_session_lock_layer_manager_v1::CosmicSessionLockLayerManagerV1,
     },
     sctk::{
         activation::{ActivationState, RequestData},
         compositor::CompositorState,
         error::GlobalError,
-        globals::GlobalData,
         output::OutputState,
         reexports::{
             calloop::{LoopHandle, timer::TimeoutAction},
@@ -66,6 +65,7 @@ use cctk::{
                     wl_touch::WlTouch,
                 },
             },
+            protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         },
         registry::RegistryState,
         seat::{
@@ -84,10 +84,7 @@ use cctk::{
                 Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface,
                 LayerSurfaceConfigure, SurfaceKind,
             },
-            xdg::{
-                XdgPositioner, XdgShell,
-                popup::{Popup, PopupConfigure},
-            },
+            xdg::{XdgPositioner, XdgShell, popup::Popup},
         },
         shm::{Shm, multi::MultiPool},
     },
@@ -96,6 +93,7 @@ use cctk::{
 };
 use iced_runtime::{
     core::{self, Point, touch},
+    keyboard::key::Named::Settings,
     platform_specific::{
         self,
         wayland::{
@@ -107,7 +105,10 @@ use iced_runtime::{
     },
 };
 use wayland_protocols::{
-    ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+    ext::background_effect::v1::client::{
+        ext_background_effect_manager_v1,
+        ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+    },
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
         keyboard_shortcuts_inhibit::zv1::client::{
@@ -121,6 +122,13 @@ use wayland_protocols::{
 };
 
 pub static TOKEN_CTR: AtomicU32 = AtomicU32::new(0);
+
+/// The requested cursor for a surface
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CursorRequest {
+    pub(crate) icon: Option<CursorIcon>,
+    pub(crate) hidden: bool,
+}
 
 #[derive(Debug)]
 pub(crate) struct SctkSeat {
@@ -138,6 +146,8 @@ pub(crate) struct SctkSeat {
     pub(crate) active_icon: Option<CursorIcon>,
     // Cursor icon set by application
     pub(crate) icon: Option<CursorIcon>,
+    // Application asked for cursor to hide
+    pub(crate) hidden: bool,
 }
 
 impl SctkSeat {
@@ -145,6 +155,35 @@ impl SctkSeat {
         if let Some(ptr) = self.ptr.as_ref() {
             _ = ptr.set_cursor(conn, icon);
             self.active_icon = Some(icon);
+        }
+    }
+
+    /// Is the pointer currently over `surface`.
+    pub(crate) fn is_over(&self, surface: &ObjectId) -> bool {
+        self.ptr_focus.as_ref().is_some_and(|s| &s.id() == surface)
+    }
+
+    /// Set cursor visibility over this surfaces.
+    pub(crate) fn set_cursor_visible(
+        &mut self,
+        conn: &Connection,
+        visible: bool,
+    ) {
+        let Some(ptr) = self.ptr.as_ref() else {
+            return;
+        };
+
+        self.hidden = !visible;
+
+        if visible {
+            let icon = self.icon.unwrap_or(CursorIcon::Default);
+            _ = ptr.set_cursor(conn, icon);
+            self.active_icon = Some(icon);
+        } else {
+            // Ignoring the error
+            // It only fails when the pointer is not on our surface (due to serial error)
+            _ = ptr.hide_cursor();
+            self.active_icon = None;
         }
     }
 }
@@ -263,47 +302,6 @@ impl From<LogicalSize<u32>> for Common {
 }
 
 #[derive(Debug)]
-pub struct SctkPopup {
-    pub(crate) popup: Popup,
-    pub(crate) last_configure: Option<PopupConfigure>,
-    pub(crate) _pending_requests:
-        Vec<platform_specific::wayland::popup::Action>,
-    pub(crate) data: SctkPopupData,
-    pub(crate) common: Arc<Mutex<Common>>,
-    pub(crate) wp_fractional_scale: Option<WpFractionalScaleV1>,
-    pub(crate) close_with_children: bool,
-}
-
-impl SctkPopup {
-    pub(crate) fn set_size(&mut self, w: u32, h: u32, token: u32) {
-        let guard = self.common.lock().unwrap();
-        if guard.size.width == w && guard.size.height == h {
-            return;
-        }
-        drop(guard);
-        // update geometry
-        self.popup
-            .xdg_surface()
-            .set_window_geometry(0, 0, w as i32, h as i32);
-        self.update_viewport(w, h);
-        // update positioner
-        self.data.positioner.set_size(w as i32, h as i32);
-        self.popup.reposition(&self.data.positioner, token);
-    }
-
-    pub(crate) fn update_viewport(&mut self, w: u32, h: u32) {
-        let common = self.common.lock().unwrap();
-        if common.size.width == w && common.size.height == h {
-            return;
-        }
-        if let Some(viewport) = common.wp_viewport.as_ref() {
-            // Set inner size without the borders.
-            viewport.set_destination(w as i32, h as i32);
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct SctkLockSurface {
     pub(crate) id: core::window::Id,
     pub(crate) session_lock_surface: SessionLockSurface,
@@ -336,27 +334,18 @@ pub struct SctkSubsurface {
 pub struct SctkPopupData {
     pub(crate) id: core::window::Id,
     pub(crate) parent: PopupParent,
+    pub(crate) parent_window: core::window::Id,
     pub(crate) toplevel: WlSurface,
     pub(crate) positioner: Arc<XdgPositioner>,
     pub(crate) grab: bool,
 }
 
-#[derive(Debug)]
-pub struct MyCosmicCornerRadiusToplevelV1(CosmicCornerRadiusToplevelV1);
-
-impl Drop for MyCosmicCornerRadiusToplevelV1 {
-    fn drop(&mut self) {
-        self.0.destroy();
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct SctkCornerRadius(Arc<MyCosmicCornerRadiusToplevelV1>);
+pub struct SctkCornerRadius(Arc<CornerRadiusWrapper>);
 
 pub struct SctkWindow {
     pub(crate) window: Arc<dyn winit::window::Window>,
     pub(crate) id: core::window::Id,
-    pub(crate) corner_radius: Option<(SctkCornerRadius, Option<CornerRadius>)>,
 }
 
 impl SctkWindow {
@@ -440,11 +429,15 @@ pub struct SctkState {
     /// `WindowUpdate` or buffer on the associated with it `WindowHandle`.
     pub(crate) windows: Vec<SctkWindow>,
     pub(crate) layer_surfaces: Vec<SctkLayerSurface>,
-    pub(crate) popups: Vec<SctkPopup>,
+    pub(crate) popmgr: PopupManager,
     pub(crate) subsurfaces: Vec<SctkSubsurface>,
     pub(crate) lock_surfaces: Vec<SctkLockSurface>,
-    pub(crate) blur_surfaces: HashMap<core::window::Id, Vec<ExtBackgroundEffectSurfaceV1>>,
+    pub(crate) blur_surfaces: HashMap<core::window::Id, ExtBackgroundEffectSurfaceV1>,
+    pub(crate) corner_radii: HashMap<core::window::Id, (SctkCornerRadius, Option<CornerRadius>)>,
     pub(crate) touch_points: HashMap<touch::Finger, (WlSurface, Point)>,
+    /// List of layer surfaces whose keyboard leave was ignored because focus moved
+    /// to one of their own grabbing popups. Their next enter is swallowed too.
+    pub(crate) kbd_leave_to_own_popup: HashSet<ObjectId>,
 
     /// Window updates, which are coming from SCTK or the compositor, which require
     /// calling back to the sctk's downstream. They are handled right in the event loop,
@@ -479,6 +472,7 @@ pub struct SctkState {
     pub(crate) session_lock_state: SessionLockState,
     pub(crate) session_lock: Option<SessionLock>,
     pub(crate) id_map: HashMap<ObjectId, core::window::Id>,
+    pub(crate) cursor_requests: HashMap<ObjectId, CursorRequest>,
     pub(crate) to_commit: HashMap<core::window::Id, WlSurface>,
     pub(crate) destroyed: HashSet<core::window::Id>,
     pub(crate) pending_popup: Option<(SctkPopupSettings, usize)>,
@@ -487,6 +481,7 @@ pub struct SctkState {
     pub(crate) toplevel_manager: Option<ToplevelManagerState>,
     pub(crate) subsurface_state: Option<SubsurfaceState>,
     pub(crate) ext_background_effect_manager: Option<ext_background_effect::ExtBackgroundEffectManager>,
+    pub(crate) cosmic_session_lock_layer_manager: Option<CosmicSessionLockLayerManagerV1>,
 
     pub(crate) activation_token_ctr: u32,
     pub(crate) token_senders: HashMap<u32, oneshot::Sender<Option<String>>>,
@@ -497,6 +492,7 @@ pub struct SctkState {
 
     pub(crate) corner_radius_manager: Option<CosmicCornerRadiusManagerV1>,
     pub(crate) pending_corner_radius: HashMap<core::window::Id, CornerRadius>,
+    pub(crate) pending_blur: HashMap<core::window::Id, Vec<Rectangle>>,
 
     pub(crate) text_input_manager: Option<TextInputManager>,
     pub(crate) text_input: Option<Arc<ZwpTextInputV3>>,
@@ -580,6 +576,17 @@ pub(crate) fn receive_frame(
 }
 
 impl SctkState {
+    /// What a surface wants the pointer over it to be.
+    pub(crate) fn record_cursor(
+        &mut self,
+        surface: ObjectId,
+        amend: impl FnOnce(&mut CursorRequest),
+    ) {
+        self.cursor_requests
+            .retain(|id, _| id == &surface || self.id_map.contains_key(id));
+        amend(self.cursor_requests.entry(surface).or_default());
+    }
+
     pub fn request_redraw(&mut self, surface: &WlSurface) {
         let e = self
             .frame_status
@@ -616,11 +623,7 @@ impl SctkState {
             }
         }
 
-        if let Some(popup) = self
-            .popups
-            .iter_mut()
-            .find(|p| p.popup.wl_surface() == surface)
-        {
+        if let Some(popup) = self.popmgr.popup(surface) {
             id = Some(popup.data.id);
             if legacy && popup.wp_fractional_scale.is_some() {
                 return;
@@ -681,6 +684,33 @@ impl SctkState {
         // TODO winit sets cursor size after handling the change for the window, so maybe that should be done as well.
     }
 
+    /// Popups can only be attached to xdg or layer surfaces. So for subsurfaces, we return the
+    /// parent, and adjust the offset.
+    pub(crate) fn subsurface_popup_parent(
+        &self,
+        id: core::window::Id,
+    ) -> Option<(WlSurface, (i32, i32))> {
+        let mut sub = self.subsurfaces.iter().find(|s| s.id == id)?;
+        let mut offset = (0, 0);
+        // bounded by the number of subsurfaces so a corrupt chain cannot spin forever
+        for _ in 0..=self.subsurfaces.len() {
+            if let Some(b) = sub.instance.bounds {
+                offset.0 += b.x as i32;
+                offset.1 += b.y as i32;
+            }
+            let parent = &sub.instance.parent;
+            match self
+                .subsurfaces
+                .iter()
+                .find(|s| s.instance.wl_surface == *parent)
+            {
+                Some(s) => sub = s,
+                None => return Some((parent.clone(), offset)),
+            }
+        }
+        None
+    }
+
     pub fn get_popup(
         &mut self,
         settings: SctkPopupSettings,
@@ -696,7 +726,7 @@ impl SctkState {
     > {
         if self.layer_surfaces.iter().any(|s| s.id == settings.id)
             || self.windows.iter().any(|w| w.id == settings.id)
-            || self.popups.iter().any(|p| p.data.id == settings.id)
+            || self.popmgr.popup_id(settings.id).is_some()
             || self.subsurfaces.iter().any(|s| s.id == settings.id)
         {
             log::warn!(
@@ -720,16 +750,32 @@ impl SctkState {
                 PopupParent::Window(parent.wl_surface(&self.connection)),
                 parent.wl_surface(&self.connection),
             )
-        } else if let Some(i) = self
-            .popups
-            .iter()
-            .position(|p| p.data.id == settings.parent)
-        {
-            let parent = &self.popups[i];
+        } else if let Some(parent) = self.popmgr.popup_id(settings.parent) {
             (
                 PopupParent::Popup(parent.popup.wl_surface().clone()),
                 parent.data.toplevel.clone(),
             )
+        } else if let Some((surface, _)) =
+            self.subsurface_popup_parent(settings.parent)
+        {
+            if self
+                .layer_surfaces
+                .iter()
+                .any(|l| *l.surface.wl_surface() == surface)
+            {
+                (PopupParent::LayerSurface(surface.clone()), surface)
+            } else if self
+                .windows
+                .iter()
+                .any(|w| w.wl_surface(&self.connection) == surface)
+            {
+                (PopupParent::Window(surface.clone()), surface)
+            } else if let Some(p) = self.popmgr.popup(&surface) {
+                (PopupParent::Popup(surface), p.data.toplevel.clone())
+            } else {
+                // e.g. a session lock surface, which cannot parent xdg popups
+                return Err(PopupCreationError::ParentMissing);
+            }
         } else {
             return Err(PopupCreationError::ParentMissing);
         };
@@ -763,6 +809,7 @@ impl SctkState {
         if positioner.version() >= 3 && settings.positioner.reactive {
             positioner.set_reactive();
         }
+
         positioner.set_size(size.0 as i32, size.1 as i32);
 
         let grab = settings.grab;
@@ -827,10 +874,9 @@ impl SctkState {
                 )
             }
             PopupParent::Popup(parent) => {
-                let Some(parent_xdg) = self.popups.iter().find_map(|p| {
-                    (p.popup.wl_surface() == parent)
-                        .then(|| p.popup.xdg_surface())
-                }) else {
+                let Some(parent_xdg) =
+                    self.popmgr.popup(parent).map(|p| p.popup.xdg_surface())
+                else {
                     return Err(PopupCreationError::ParentMissing);
                 };
 
@@ -847,6 +893,7 @@ impl SctkState {
                 )
             }
         };
+        let toplevel = toplevel.clone();
 
         popup.xdg_surface().set_window_geometry(
             0,
@@ -879,7 +926,15 @@ impl SctkState {
         }
 
         _ = wl_surface.frame(&self.queue_handle, wl_surface.clone());
-        wl_surface.commit();
+
+        if let Some(old) = self.blur_surfaces.remove(&settings.id) {
+            old.destroy();
+        }
+        _ = self.corner_radii.remove(&settings.id);
+
+        if let Some(blur) = self.pending_blur.remove(&settings.id) {
+            self.apply_blur(settings.id, Some(blur), &wl_surface);
+        }
 
         let wp_viewport = self.viewporter_state.as_ref().map(|state| {
             let viewport =
@@ -896,11 +951,12 @@ impl SctkState {
         let common = Arc::new(Mutex::new(common));
         let positioner = Arc::new(positioner);
 
-        self.popups.push(SctkPopup {
+        self.popmgr.push(popup::SctkPopup {
             popup: popup.clone(),
             data: SctkPopupData {
                 id: settings.id,
                 parent: parent.clone(),
+                parent_window: settings.parent,
                 toplevel: toplevel.clone(),
                 positioner: positioner.clone(),
                 grab: settings.grab,
@@ -912,6 +968,13 @@ impl SctkState {
             close_with_children: settings.close_with_children,
         });
 
+        if let Some(corners) = self.pending_corner_radius.remove(&settings.id) {
+            self.handle_action(Action::RoundedCorners(
+                settings.id,
+                Some(corners),
+            ));
+        }
+        wl_surface.commit();
         Ok((
             settings.id,
             parent.wl_surface().clone(),
@@ -948,7 +1011,7 @@ impl SctkState {
 
         if self.layer_surfaces.iter().any(|s| s.id == id)
             || self.windows.iter().any(|w| w.id == id)
-            || self.popups.iter().any(|p| p.data.id == id)
+            || self.popmgr.popup_id(id).is_some()
             || self.subsurfaces.iter().any(|s| s.id == id)
         {
             log::warn!("Layer surface with id {id:?} already exists");
@@ -1007,7 +1070,15 @@ impl SctkState {
             layer_surface.set_input_region(Some(&region));
             region.destroy();
         }
-        layer_surface.commit();
+
+        if let Some(old) = self.blur_surfaces.remove(&id) {
+            old.destroy();
+        }
+        _ = self.corner_radii.remove(&id);
+
+        if let Some(blur) = self.pending_blur.remove(&id) {
+            self.apply_blur(id, Some(blur), &wl_surface);
+        }
 
         let wp_viewport = self.viewporter_state.as_ref().map(|state| {
             state.get_viewport(layer_surface.wl_surface(), &self.queue_handle)
@@ -1041,6 +1112,10 @@ impl SctkState {
             wp_fractional_scale,
             common: common.clone(),
         });
+        if let Some(corners) = self.pending_corner_radius.remove(&id) {
+            _ = self.handle_action(Action::RoundedCorners(id, Some(corners)));
+        }
+        layer_surface.commit();
         Ok((id, CommonSurface::Layer(layer_surface), common))
     }
     pub fn get_lock_surface(
@@ -1050,7 +1125,7 @@ impl SctkState {
     ) -> Option<(CommonSurface, Arc<Mutex<Common>>)> {
         if self.layer_surfaces.iter().any(|s| s.id == id)
             || self.windows.iter().any(|w| w.id == id)
-            || self.popups.iter().any(|p| p.data.id == id)
+            || self.popmgr.popup_id(id).is_some()
             || self.subsurfaces.iter().any(|s| s.id == id)
         {
             log::warn!("Lock surface with id {id:?} already exists");
@@ -1129,14 +1204,17 @@ impl SctkState {
                             }
                         },
                         platform_specific::wayland::layer_surface::Action::Destroy(id) => {
+                            if let Some(id) = self.layer_surfaces.iter().find_map(|l| if l.id == id {self.popmgr.popups().find_map(|p| (p.data.parent.wl_surface() == l.surface.wl_surface()).then(|| p.data.id))} else {None}).clone() {
+                                _ = self.handle_action(Action::Popup(platform_specific::wayland::popup::Action::Destroy { id }));
+                            }
                             if let Some(i) = self.layer_surfaces.iter().position(|l| l.id == id) {
                                 let l = self.layer_surfaces.remove(i);
+                                _ = self.kbd_leave_to_own_popup.remove(&l.surface.wl_surface().id());
 
                                 if let Some(blurred) = self.blur_surfaces.remove(&l.id) {
-                                    for s in blurred {
-                                        s.destroy();
-                                    }
+                                    blurred.destroy();
                                 }
+                                _ = self.corner_radii.remove(&id);
 
                                 let (removed, remaining): (Vec<_>, Vec<_>) =  self
                                     .subsurfaces
@@ -1159,6 +1237,7 @@ impl SctkState {
                                 if let Some(destroyed) = self.id_map.remove(&l.surface.wl_surface().id()) {
                                     _ = self.destroyed.insert(destroyed);
                                 }
+
                                 send_event(&self.events_sender, &self.proxy, SctkEvent::LayerSurfaceEvent {
                                             variant: LayerSurfaceEventVariant::Done,
                                             id: l.surface.wl_surface().clone(),
@@ -1233,205 +1312,229 @@ impl SctkState {
 
                             }
                         },
-                },
-            Action::Popup(action) => match action {
-                platform_specific::wayland::popup::Action::Popup { popup: settings } => {
-                    // first check existing popup
-                    if let Some(existing) = self.popups.iter().position(|p| p.data.id == settings.id
-                    && (
-                        self.popups.iter().any(|parent| parent.popup.wl_surface() == p.data.parent.wl_surface() && parent.data.id == settings.parent)
-                        || self.windows.iter().any(|w| w.id == settings.parent && *p.data.parent.wl_surface() == w.wl_surface(&self.connection))
-                        || self.layer_surfaces.iter().any(|l| l.id == settings.parent && p.data.parent.wl_surface() == l.surface.wl_surface()))
-                    ) {
-                        let existing = &mut self.popups[existing];
-                        let size = if settings.positioner.size.is_none() {
-                            log::info!("No configured popup size");
-                            (1, 1)
-                        } else {
-                            settings.positioner.size.unwrap()
-                        };
-                        let Ok(positioner) = XdgPositioner::new(&self.xdg_shell_state)
-                            .map_err(PopupCreationError::PositionerCreationFailed) else {
-                                log::error!("Failed to create popup positioner");
-                                return Ok(());
-                            };
-                        positioner.set_anchor(settings.positioner.anchor);
-                        positioner.set_anchor_rect(
-                            settings.positioner.anchor_rect.x,
-                            settings.positioner.anchor_rect.y,
-                            settings.positioner.anchor_rect.width,
-                            settings.positioner.anchor_rect.height,
-                        );
-                        if let Ok(constraint_adjustment) =
-                            settings.positioner.constraint_adjustment.try_into()
-                        {
-                            positioner.set_constraint_adjustment(constraint_adjustment);
-                        }
-                        positioner.set_gravity(settings.positioner.gravity);
-                        positioner.set_offset(
-                            settings.positioner.offset.0,
-                            settings.positioner.offset.1,
-                        );
-                        if settings.positioner.reactive {
-                            positioner.set_reactive();
-                        }
-                        positioner.set_size(size.0 as i32, size.1 as i32);
-                        existing.data.positioner = Arc::new(positioner);
-                        existing.set_size(size.0, size.1, TOKEN_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                        _ = send_event(&self.events_sender, &self.proxy,
-                            SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Size(size.0, size.1), toplevel_id: existing.data.parent.wl_surface().clone(), parent_id: existing.data.parent.wl_surface().clone(), id: existing.popup.wl_surface().clone() });
-                        return Ok(());
-                    }
-                    let mut parent_mismatch = !self.popups.is_empty();
-                    for p in &self.popups {
-                        parent_mismatch = p.data.id != settings.parent;
-                    }
-                    if !self.destroyed.is_empty() || parent_mismatch {
-                        if parent_mismatch {
-                            let mut found = false;
-                            for p in std::mem::take(&mut self.popups).into_iter().rev() {
-                                let id = p.data.id;
-                                self.popups.insert(0, p);
-
-                                found |= id == settings.parent;
-                                if !found  {
-                                    _ = self.handle_action(Action::Popup(platform_specific::wayland::popup::Action::Destroy{id}));
+                        platform_specific::wayland::layer_surface::Action::Padding { id, padding } => {
+                            // corner radius padding
+                            if let Some((protocol_object, _)) = self.corner_radii.get_mut(&id) {
+                                if let CornerRadiusWrapper::Wlr(protocol_object) = protocol_object.0.as_ref() {
+                                    protocol_object.set_padding(padding.top, padding.right, padding.bottom, padding.left);
                                 }
-
+                            }
+                        },
+                        platform_specific::wayland::layer_surface::Action::ShowOnLock { id, value } => {
+                            if let Some(layer_surface) = self.layer_surfaces.iter_mut().find(|l| l.id == id) {
+                                if let SurfaceKind::Wlr(wlr) = layer_surface.surface.kind() {
+                                    if let Some(manager) = &self.cosmic_session_lock_layer_manager {
+                                        if value {
+                                            manager.set_show_on_lock(wlr);
+                                        } else {
+                                            manager.unset_show_on_lock(wlr);
+                                        }
+                                        _ = self.to_commit.insert(id, layer_surface.surface.wl_surface().clone());
+                                    }
+                                }
                             }
                         }
-                        if self.pending_popup.replace((settings, 0)).is_none() {
-
-                            let timer = cctk::sctk::reexports::calloop::timer::Timer::from_duration(Duration::from_millis(30));
-                            let queue_handle = self.queue_handle.clone();
-                            _ = self.loop_handle.insert_source(timer, move |_, _, state| {
-                                let Some((mut popup, attempt)) = state.pending_popup.take() else {
-                                    return TimeoutAction::Drop;
+                },
+            Action::Popup(action) => {
+                match action {
+                    platform_specific::wayland::popup::Action::Popup { popup: mut settings } => {
+                        // anchor rects from widgets inside a subsurface are in that subsurface's coordinates
+                        if let Some((_, (dx, dy))) = self.subsurface_popup_parent(settings.parent) {
+                            settings.positioner.anchor_rect.x += dx;
+                            settings.positioner.anchor_rect.y += dy;
+                        }
+                        // first check existing popup
+                        // if an existing popup with the same id exists, we just update the positioner.
+                        if let Some((chain, existing)) = self.popmgr.popup_id(settings.id).and_then(|p|
+                                (p.data.grab == settings.grab && self.popmgr.popups().any(|parent| parent.popup.wl_surface() == p.data.parent.wl_surface() && parent.data.id == settings.parent)
+                                || self.windows.iter().any(|w| w.id == settings.parent && *p.data.parent.wl_surface() == w.wl_surface(&self.connection))
+                                || self.layer_surfaces.iter().any(|l| l.id == settings.parent && p.data.parent.wl_surface() == l.surface.wl_surface())
+                                || (p.data.parent_window == settings.parent && self.subsurfaces.iter().any(|s| s.id == settings.parent))).then(||
+                            {
+                                p.popup.wl_surface().clone()
+                            })).and_then(|s| self.popmgr.chain_for_popup_mut(&s))
+                        {
+                            let existing = &mut chain[existing];
+                            let size = if let Some(size) = settings.positioner.size {
+                                size
+                            } else {
+                                let guard = existing.common.lock().unwrap();
+                                (guard.size.width, guard.size.height)
+                            };
+                            let Ok(positioner) = XdgPositioner::new(&self.xdg_shell_state)
+                                .map_err(PopupCreationError::PositionerCreationFailed) else {
+                                    log::error!("Failed to create popup positioner");
+                                    return Ok(());
                                 };
+                            positioner.set_anchor(settings.positioner.anchor);
+                            positioner.set_anchor_rect(
+                                settings.positioner.anchor_rect.x,
+                                settings.positioner.anchor_rect.y,
+                                settings.positioner.anchor_rect.width,
+                                settings.positioner.anchor_rect.height,
+                            );
+                            if let Ok(constraint_adjustment) =
+                                settings.positioner.constraint_adjustment.try_into()
+                            {
+                                positioner.set_constraint_adjustment(constraint_adjustment);
+                            }
+                            positioner.set_gravity(settings.positioner.gravity);
+                            positioner.set_offset(
+                                settings.positioner.offset.0,
+                                settings.positioner.offset.1,
+                            );
+                            if settings.positioner.reactive {
+                                positioner.set_reactive();
+                            }
+                            positioner.set_size(size.0 as i32, size.1 as i32);
+                            existing.data.positioner = Arc::new(positioner);
+                            existing.set_size(size.0, size.1, TOKEN_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                            _ = send_event(&self.events_sender, &self.proxy,
+                                SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Size(size.0, size.1), toplevel_id: existing.data.parent.wl_surface().clone(), parent_id: existing.data.parent.wl_surface().clone(), id: existing.popup.wl_surface().clone(), parent_window: existing.data.parent_window });
+                            return Ok(());
+                        } else if !self.destroyed.is_empty() || self.popmgr.popup_id(settings.id).is_some() || self.popmgr.active_grab().is_some()
+                        {
+                            // must clean up popup chains so that there is just one grab chain...
+                            let to_destroy = if settings.grab {
+                                if let Some((grab_chain, p_i)) = self.popmgr.active_grab().and_then(|g| self.popmgr.chain_for_popup(g.popup.wl_surface())) {
 
-                                if !state.destroyed.is_empty() ||  state.popups.last().is_some_and(|p| {
-                                    state.id_map.get(&p.popup.wl_surface().id()).map_or(true, |p| *p != popup.parent)
-                                })  {
-                                    if attempt < 5 {
-                                        state.pending_popup = Some((popup, attempt+1));
-                                        TimeoutAction::ToDuration(Duration::from_millis(30))
+                                    if let Some(pos) = grab_chain.iter().position(|p| p.data.id  == settings.parent) {
+                                        // destroy children of parent
+                                        grab_chain.get(pos + 1).map(|g| g.data.id)
                                     }
                                     else {
-                                        TimeoutAction::Drop
+                                        // destroy whole chain...
+                                        grab_chain.get(0).map(|g| g.data.id)
                                     }
                                 } else {
-                                    match state.get_popup(popup) {
-                                        Ok((id, parent_id, toplevel_id, surface, common)) => {
-                                            let wl_surface = surface.wl_surface().clone();
-                                            receive_frame(&mut state.frame_status, &wl_surface);
-                                            send_event(&state.events_sender, &state.proxy,
-                                                SctkEvent::PopupEvent {
-                                                    variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(queue_handle.clone(), surface, id, common, state.connection.display()),
-                                                    toplevel_id, parent_id, id: wl_surface });
-                                        }
-                                        Err(err) => {
-                                            log::error!("Failed to create popup. {err:?}");
-                                        }
-                                    };
-                                    TimeoutAction::Drop
+                                    None
                                 }
-                            });
-                        }
-                        // log::error!("Invalid popup Id {:?}", popup.id);
-                    } else {
-                        self.pending_popup = None;
-                        match self.get_popup(settings) {
-                            Ok((id, parent_id, toplevel_id, surface, common)) => {
-                                let wl_surface = surface.wl_surface().clone();
-                                send_event(&self.events_sender, &self.proxy,
-                                    SctkEvent::PopupEvent {
-                                        variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(self.queue_handle.clone(), surface, id, common, self.connection.display()),
-                                        toplevel_id, parent_id, id: wl_surface });
+                            } else {
+                                None
+                            };
+                            if let Some(to_destroy) = to_destroy {
+                                _ = self.destroy_popup(to_destroy, true);
                             }
-                            Err(err) => {
-                                log::error!("Failed to create popup. {err:?}");
+
+                            if self.popmgr.popup_id(settings.id).is_some() {
+                                let _  = self.handle_action(Action::Popup(platform_specific::wayland::popup::Action::Destroy { id: settings.id }));
+                            }
+                            if self.pending_popup.replace((settings, 0)).is_none() {
+                                let timer = cctk::sctk::reexports::calloop::timer::Timer::from_duration(Duration::from_millis(30));
+                                let queue_handle = self.queue_handle.clone();
+                                _ = self.loop_handle.insert_source(timer, move |_, _, state| {
+                                    let Some((settings, attempt)) = state.pending_popup.take() else {
+                                        return TimeoutAction::Drop;
+                                    };
+                                    // check if the mismatch still exists...
+                                    if !state.destroyed.is_empty() || state.popmgr.popup_id(settings.id).is_some_and(|p|
+                                    state.popmgr.popups().any(|parent| parent.popup.wl_surface() == p.data.parent.wl_surface() && parent.data.id == settings.parent))
+                                    {
+                                        if attempt < 5 {
+                                            state.pending_popup = Some((settings, attempt+1));
+                                            TimeoutAction::ToDuration(Duration::from_millis(30))
+                                        }
+                                        else {
+                                            TimeoutAction::Drop
+                                        }
+                                    } else {
+                                        let parent_window = settings.parent;
+                                        match state.get_popup(settings) {
+                                            Ok((id, parent_id, toplevel_id, surface, common)) => {
+                                                let wl_surface = surface.wl_surface().clone();
+                                                receive_frame(&mut state.frame_status, &wl_surface);
+                                                send_event(&state.events_sender, &state.proxy,
+                                                    SctkEvent::PopupEvent {
+                                                        variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(queue_handle.clone(), surface, id, common, state.connection.display()),
+                                                        toplevel_id, parent_id, id: wl_surface, parent_window });
+                                            }
+                                            Err(err) => {
+                                                log::error!("Failed to create popup. {err:?}");
+                                            }
+                                        };
+                                        TimeoutAction::Drop
+                                    }
+                                });
+                            }
+                        } else {
+                            let parent_window = settings.parent;
+                            match self.get_popup(settings) {
+                                Ok((id, parent_id, toplevel_id, surface, common)) => {
+                                    let wl_surface = surface.wl_surface().clone();
+                                    send_event(&self.events_sender, &self.proxy,
+                                        SctkEvent::PopupEvent {
+                                            variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(
+                                                self.queue_handle.clone(), surface, id, common, self.connection.display()
+                                            ),
+                                            toplevel_id, parent_id, id: wl_surface, parent_window }
+                                    );
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to create popup. {err:?}");
+                                }
                             }
                         }
-                    }
-                },
-                // XXX popup destruction must be done carefully
-                // first destroy the uppermost popup, then work down to the requested popup
-                platform_specific::wayland::popup::Action::Destroy { id } => {
-                    let sctk_popup = match self
-                        .popups
-                        .iter()
-                        .position(|s| s.data.id == id)
-                    {
-                        Some(p) => self.popups.remove(p),
-                        None => {
-                            log::info!("No popup to destroy");
-                            return Ok(());
-                        },
-                    };
-                    let mut to_destroy = vec![sctk_popup];
-                    // TODO optionally destroy parents if they request to be destroyed with children
-                    while let Some(popup_to_destroy_last) = to_destroy.last().and_then(|popup| self
-                        .popups
-                        .iter()
-                        .position(|p| popup.data.parent.wl_surface() == p.popup.wl_surface() && p.close_with_children)) {
-                        let popup_to_destroy_last = self.popups.remove(popup_to_destroy_last);
-                        to_destroy.push(popup_to_destroy_last);
-                    }
-                    to_destroy.reverse();
-
-                    while let Some(popup_to_destroy_first) = to_destroy.last().and_then(|popup| self
-                        .popups
-                        .iter()
-                        .position(|p| p.data.parent.wl_surface() == popup.popup.wl_surface())) {
-                        let popup_to_destroy_first = self.popups.remove(popup_to_destroy_first);
-                        to_destroy.push(popup_to_destroy_first);
-                    }
-                    for popup in to_destroy.into_iter().rev() {
-                        if let Some(id) = self.id_map.remove(&popup.popup.wl_surface().id()) {
-                            _ = self.destroyed.insert(id);
+                    },
+                    // XXX popup destruction must be done carefully
+                    // first destroy the uppermost popup, then work down to the requested popup
+                    platform_specific::wayland::popup::Action::Destroy { id } => {
+                        if let Some(value) = self.destroy_popup(id, false) {
+                            return value;
                         }
-
-                        if let Some(blurred) = self.blur_surfaces.remove(&id) {
-                            for s in blurred {
-                                s.destroy();
-                            }
-                        }
-
-                        let (removed, remaining): (Vec<_>, Vec<_>) =  self
-                            .subsurfaces
-                            .drain(..)
-                            .partition(|s| {
-                                s.instance.parent == *popup.popup.wl_surface()
-                            });
-
-                        self.subsurfaces = remaining;
-                        for s in removed
+                    },
+                    platform_specific::wayland::popup::Action::Size { id, width, height } => {
+                        if let Some(sctk_popup) = self
+                            .popmgr.popup_id_mut(id)
                         {
-                            crate::subsurface_widget::remove_iced_subsurface(
-                                &s.instance.wl_surface,
-                            );
-                            send_event(&self.events_sender, &self.proxy,
-                                SctkEvent::SubsurfaceEvent( crate::sctk_event::SubsurfaceEventVariant::Destroyed(s.instance) )
-                            );
+                            // update geometry
+                            // update positioner
+                            sctk_popup.set_size(width, height, TOKEN_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                            let surface = sctk_popup.popup.wl_surface().clone();
+                            _ = send_event(&self.events_sender, &self.proxy,
+                                SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Size(width, height), toplevel_id: sctk_popup.data.parent.wl_surface().clone(), parent_id: sctk_popup.data.parent.wl_surface().clone(), id: surface, parent_window: sctk_popup.data.parent_window });
                         }
-                        _ = send_event(&self.events_sender, &self.proxy,
-                            SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Done, toplevel_id: popup.data.toplevel.clone(), parent_id: popup.data.parent.wl_surface().clone(), id: popup.popup.wl_surface().clone() });
-                    }
-                },
-                platform_specific::wayland::popup::Action::Size { id, width, height } => {
-                    if let Some(sctk_popup) = self
-                        .popups
-                        .iter_mut()
-                        .find(|s| s.data.id == id)
-                    {
-                        // update geometry
-                        // update positioner
-                        sctk_popup.set_size(width, height, TOKEN_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                        let surface = sctk_popup.popup.wl_surface().clone();
-                        _ = send_event(&self.events_sender, &self.proxy,
-                            SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Size(width, height), toplevel_id: sctk_popup.data.parent.wl_surface().clone(), parent_id: sctk_popup.data.parent.wl_surface().clone(), id: surface });
-                    }
-                },
+                    },
+                    platform_specific::wayland::popup::Action::Reposition { id, positioner } => {
+                        if let Some(sctk_popup) = self
+                            .popmgr.popup_id_mut(id)
+                        {
+                            sctk_popup.data.positioner.set_anchor(positioner.anchor);
+                            sctk_popup.data.positioner.set_anchor_rect(
+                                positioner.anchor_rect.x,
+                                positioner.anchor_rect.y,
+                                positioner.anchor_rect.width,
+                                positioner.anchor_rect.height,
+                            );
+                            if let Ok(constraint_adjustment) =
+                                positioner.constraint_adjustment.try_into()
+                            {
+                               sctk_popup.data.positioner.set_constraint_adjustment(constraint_adjustment);
+                            }
+                            sctk_popup.data.positioner.set_gravity(positioner.gravity);
+                            sctk_popup.data.positioner.set_offset(
+                                positioner.offset.0,
+                                positioner.offset.1,
+                            );
+                            if positioner.reactive {
+                               sctk_popup.data.positioner.set_reactive();
+                            }
+                            let guard =sctk_popup.common.lock().unwrap();
+                            let w = guard.size.width;
+                            let h = guard.size.height;
+                            drop(guard);
+                            let size = positioner.size.unwrap_or((w, h));
+                            sctk_popup.popup
+                                        .xdg_surface()
+                                        .set_window_geometry(0, 0, w as i32, h as i32);
+                            sctk_popup.update_viewport(w, h);
+                            // update positioner
+                            sctk_popup.data.positioner.set_size(w as i32, h as i32);
+                            sctk_popup.popup.reposition(&sctk_popup.data.positioner, TOKEN_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));                        let surface = sctk_popup.popup.wl_surface().clone();
+                            _ = send_event(&self.events_sender, &self.proxy,
+                                SctkEvent::PopupEvent { variant: crate::sctk_event::PopupEventVariant::Size(size.0, size.1), toplevel_id: sctk_popup.data.parent.wl_surface().clone(), parent_id: sctk_popup.data.parent.wl_surface().clone(), id: surface, parent_window: sctk_popup.data.parent_window });
+                        }
+                    },
+                }
             },
             Action::Activation(activation_event) => match activation_event {
                 platform_specific::wayland::activation::Action::RequestToken { app_id, window, channel } => {
@@ -1520,10 +1623,10 @@ impl SctkState {
                     {
                         let surface = self.lock_surfaces.remove(i);
                         if let Some(blurred) = self.blur_surfaces.remove(&surface.id) {
-                            for s in blurred {
-                                s.destroy();
-                            }
+                            blurred.destroy();
                         }
+                        _ = self.corner_radii.remove(&id);
+
                         let (removed, remaining): (Vec<_>, Vec<_>) =  self
                             .subsurfaces
                             .drain(..)
@@ -1563,7 +1666,7 @@ impl SctkState {
                         };
                         let notification = overlap_notify_state.notify.notify_on_overlap(wlr, &self.queue_handle, OverlapNotificationV1 { surface: layer_surface.surface.wl_surface().clone() });
                         _ = self.overlap_notifications.insert(my_id, notification);
-                    } else {
+                    } else if !enabled {
                         _ = self.overlap_notifications.remove(&my_id);
                     }
                 } else {
@@ -1605,10 +1708,10 @@ impl SctkState {
                     }
                     for (destroyed, parent, id) in destroyed {
                         if let Some(blurred) = self.blur_surfaces.remove(&id) {
-                            for s in blurred {
-                                s.destroy();
-                            }
+                            blurred.destroy();
                         }
+                        _ = self.corner_radii.remove(&id);
+
                         if let Some((wl_surface, f)) = self.seats.iter_mut().find(|f| {
                             f.kbd_focus.as_ref().is_some_and(|f| *f == destroyed)
                         }).and_then(|f| Some((parent, &mut f.kbd_focus))) {
@@ -1617,9 +1720,13 @@ impl SctkState {
                     }
                 },
                 subsurface::Action::Reposition { id, x, y } => {
-                    if let Some(subsurface) = self.subsurfaces.iter().find(|s| s.id == id) {
+                    if let Some(subsurface) = self.subsurfaces.iter_mut().find(|s| s.id == id) {
                         subsurface.instance.wl_subsurface.set_position(x, y);
                         subsurface.instance.wl_surface.commit();
+                        if let Some(b) = subsurface.instance.bounds.as_mut() {
+                            b.x = x as f32;
+                            b.y = y as f32;
+                        }
                     }
                 },
             },
@@ -1636,8 +1743,25 @@ impl SctkState {
             }
             Action::RoundedCorners(id, v) => {
                 if let Some(manager) = self.corner_radius_manager.as_ref() {
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        let geo_size: LogicalSize<f64> = w.window.surface_size().cast::<f64>().to_logical(w.window.scale_factor());
+                    enum Surface {
+                        Xdg(XdgSurface, Option<XdgToplevel>),
+                        Wlr(ZwlrLayerSurfaceV1),
+                    }
+                    let s = if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                        Some((Surface::Xdg(w.xdg_surface(&self.connection), Some(w.xdg_toplevel(&self.connection))), w.window.surface_size().cast::<f64>().to_logical(w.window.scale_factor())))
+                    } else if let Some(p) = self.popmgr.popup_id_mut(id) {
+                        let guard = p.common.lock().unwrap();
+                        Some((Surface::Xdg(p.popup.xdg_surface().clone(), None), guard.size.cast::<f64>()))
+                    } else if let Some(l) =  self.layer_surfaces.iter_mut().find(|l| l.id == id) {
+                        let guard = l.common.lock().unwrap();
+                        match l.surface.kind() {
+                            SurfaceKind::Wlr(l) => Some((Surface::Wlr(l.clone()), guard.size.cast::<f64>())),
+                            _ => None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((s, geo_size)) = s {
                         let half_min_dim = (geo_size.width as u32).min(geo_size.height as u32) / 2;
 
                         if let Some(radii) = v {
@@ -1647,37 +1771,73 @@ impl SctkState {
                                 bottom_right: radii.bottom_right.min(half_min_dim),
                                 bottom_left: radii.bottom_left.min(half_min_dim),
                             };
-                            if let Some((protocol_object, corner_radii)) = w.corner_radius.as_mut() {
+                            if let Some((protocol_object, corner_radii)) = self.corner_radii.get_mut(&id) {
                                 if *corner_radii != Some(adjusted_radii) {
-                                    protocol_object.0.0.set_radius(
+                                    match protocol_object.0.as_ref() {
+                                        CornerRadiusWrapper::Xdg(protocol_object) => protocol_object.set_radius(
+                                            adjusted_radii.top_left,
+                                            adjusted_radii.top_right,
+                                            adjusted_radii.bottom_right,
+                                            adjusted_radii.bottom_left,
+                                        ),
+                                        CornerRadiusWrapper::Wlr(protocol_object) => protocol_object.set_radius(
+                                            adjusted_radii.top_left,
+                                            adjusted_radii.top_right,
+                                            adjusted_radii.bottom_right,
+                                            adjusted_radii.bottom_left,
+                                    )
+                                };
+                                    *corner_radii = Some(adjusted_radii.clone());
+                                }
+                            } else {
+
+                                let protocol_object = match s {
+                                    Surface::Xdg(s, w) => {
+                                        if manager.version() == 1 {
+                                            if let Some(w) = w {
+                                                CornerRadiusWrapper::Xdg(manager.get_corner_radius(&w, &self.queue_handle, ()))
+                                            } else {
+                                                log::error!("Corner radius is not supported for popups on xdg shell v1");
+                                                return Ok(());
+                                            }
+                                        } else {
+                                            CornerRadiusWrapper::Xdg(manager.get_corner_radius_surface(&s, &self.queue_handle, ()))}
+                                        }
+                                    Surface::Wlr(l) => {
+                                        if manager.version() == 1 {
+                                            return Ok(());
+                                        }
+                                        CornerRadiusWrapper::Wlr(manager.get_corner_radius_layer(&l, &self.queue_handle, ()))}
+                                };
+                                match &protocol_object {
+                                    CornerRadiusWrapper::Xdg(protocol_object) => protocol_object.set_radius(
                                         adjusted_radii.top_left,
                                         adjusted_radii.top_right,
                                         adjusted_radii.bottom_right,
                                         adjusted_radii.bottom_left,
-                                    );
-                                    *corner_radii = Some(adjusted_radii.clone());
-                                }
-                            } else {
-                                let toplevel = w.xdg_toplevel(&self.connection);
-
-                                let protocol_object = manager.get_corner_radius(&toplevel, &self.queue_handle, ());
-
-                                protocol_object.set_radius(
-                                    adjusted_radii.top_left,
-                                    adjusted_radii.top_right,
-                                    adjusted_radii.bottom_right,
-                                    adjusted_radii.bottom_left,
-                                );
-                                w.corner_radius = Some((SctkCornerRadius(Arc::new(MyCosmicCornerRadiusToplevelV1( protocol_object))), Some(adjusted_radii.clone())));
+                                    ),
+                                    CornerRadiusWrapper::Wlr(protocol_object) => protocol_object.set_radius(
+                                        adjusted_radii.top_left,
+                                        adjusted_radii.top_right,
+                                        adjusted_radii.bottom_right,
+                                        adjusted_radii.bottom_left,
+                                    )
+                                };
+                                _ = self.corner_radii.insert(id, (SctkCornerRadius(Arc::new(protocol_object)), Some(adjusted_radii.clone())));
                             }
                         } else {
-                            if let Some(old) = w.corner_radius.as_mut() {
-                                old.0.0.as_ref().0.unset_radius();
+                            if let Some(old) = self.corner_radii.get_mut(&id) {
+                                match old.0.0.as_ref() {
+                                    CornerRadiusWrapper::Xdg(protocol_object) => protocol_object.unset_radius(),
+                                    CornerRadiusWrapper::Wlr(protocol_object) => {
+                                        protocol_object.unset_radius()
+                                    }
+                                };
                                 old.1 = None;
                             }
                         }
                     } else {
-                        if let Some(v) = v{
+                        if let Some(v) = v {
                             _ = self.pending_corner_radius.insert(id, v);
                         } else {
                             _ = self.pending_corner_radius.remove(&id);
@@ -1693,7 +1853,7 @@ impl SctkState {
                     return Ok(());
                 }
 
-                let s = if let Some(s) = self.popups.iter().find(|s| s.data.id == id) {
+                let s = if let Some(s) = self.popmgr.popup_id(id) {
                     s.popup.wl_surface()
                 } else if let Some(s) = self.layer_surfaces.iter().find(|s| s.id == id) {
                     s.surface.wl_surface()
@@ -1702,82 +1862,147 @@ impl SctkState {
                 } else if let Some(subsurface) = self.subsurfaces.iter().find(|s| s.id == id) {
                     &subsurface.instance.wl_surface
                 } else {
-                    log::error!("Failed to find surface for blur action");
+                    log::info!("Failed to find surface for blur action");
+                    if let Some(rectangles) = rectangles {
+                        _ = self.pending_blur.insert(id, rectangles.clone());
+                    }
                     return Ok(());
-                };
-                let existing_blur = self.blur_surfaces.entry(id);
-                match (existing_blur, rectangles) {
-                    (Entry::Occupied(occupied_entry), None) => {
-                        let blur_surfaces = occupied_entry.remove();
-                        for region in blur_surfaces {
-                            region.destroy();
-                        }
-                    },
-                    (Entry::Occupied(mut occupied_entry), Some(rectangles)) => {
-                        let blur_surfaces = occupied_entry.get_mut();
-                        let regions = rectangles.into_iter().map(|rect| {
-                            let region = self
-                                .compositor_state
-                                .wl_compositor()
-                                .create_region(&self.queue_handle, ());
-                            region.add(
-                                rect.x.round() as i32,
-                                rect.y.round() as i32,
-                                rect.width.round() as i32,
-                                rect.height.round() as i32,
-                            );
-                            region
-                        }).collect::<Vec<_>>();
-                        if regions.len() > blur_surfaces.len() {
-                            // add extra blur surfaces if needed
-                            for _ in blur_surfaces.len()..regions.len() {
-                                let Some(extra_region) = self.ext_background_effect_manager.as_mut().map(|mgr| mgr.blur(s, &self.queue_handle)) else {
-                                    log::error!("Failed to create blur effect for surface");
-                                    return Ok(());
-                                };
-                                blur_surfaces.push(extra_region);
-                            }
-                        } else if regions.len() < blur_surfaces.len() {
-                            for surface in blur_surfaces.iter().skip(regions.len()) {
-                                surface.destroy();
-                            }
-                        }
-
-                        // update existing blur surfaces
-                        for (blur_surface, region) in blur_surfaces.iter().zip(regions.into_iter()) {
-                            blur_surface.set_blur_region(Some(&region));
-                        }
-                    },
-                    (Entry::Vacant(..), None) => {
-                        // nothing to remove
-                    },
-                    (Entry::Vacant(vacant_entry), Some(rectangles)) => {
-                        if self.ext_background_effect_manager.is_none() {
-                            log::error!("Blur effect is not supported.");
-                            return Ok(());
-                        }
-                        let blur_surfaces = rectangles.into_iter().map(|rect| {
-                            let region = self
-                                .compositor_state
-                                .wl_compositor()
-                                .create_region(&self.queue_handle, ());
-                            region.add(
-                                rect.x.round() as i32,
-                                rect.y.round() as i32,
-                                rect.width.round() as i32,
-                                rect.height.round() as i32,
-                            );
-                            let blur_manager = self.ext_background_effect_manager.as_mut().unwrap();
-                            let blur_surface = blur_manager.blur(s, &self.queue_handle);
-                            blur_surface.set_blur_region(Some(&region));
-                            blur_surface
-                        }).collect::<Vec<_>>();
-                        _ = vacant_entry.insert(blur_surfaces);
-                    },
-                }
+                }.clone();
+                self.apply_blur(id, rectangles, &s)
             },
         };
         Ok(())
+    }
+
+    fn destroy_popup(
+        &mut self,
+        id: core::window::Id,
+        ignore_children: bool,
+    ) -> Option<Result<(), Infallible>> {
+        let Some(to_destroy) = self.popmgr.popup_id(id) else {
+            if self.pending_popup.take().is_none_or(|p_id| p_id.0.id != id) {
+                log::warn!(
+                    "Destroyed popup does not exist. {id:?}, existing: {:?}",
+                    self.popmgr.popups().map(|p| p.data.id).collect::<Vec<_>>()
+                );
+            }
+            return Some(Ok(()));
+        };
+        let s = to_destroy.popup.wl_surface().clone();
+        let d: Option<Vec<_>> = if ignore_children {
+            self.popmgr.remove(&s).map(|v| v.collect())
+        } else {
+            self.popmgr.remove_ignore_children(&s).map(|v| v.collect())
+        };
+        let Some(to_destroy) = d else {
+            return Some(Ok(()));
+        };
+
+        for popup in to_destroy {
+            if let Some(id) = self.id_map.remove(&popup.popup.wl_surface().id())
+            {
+                _ = self.destroyed.insert(id);
+            }
+
+            if let Some(blurred) = self.blur_surfaces.remove(&id) {
+                blurred.destroy();
+            }
+            _ = self.corner_radii.remove(&id);
+
+            let (removed, remaining): (Vec<_>, Vec<_>) = self
+                .subsurfaces
+                .drain(..)
+                .partition(|s| s.instance.parent == *popup.popup.wl_surface());
+
+            self.subsurfaces = remaining;
+            for s in removed {
+                crate::subsurface_widget::remove_iced_subsurface(
+                    &s.instance.wl_surface,
+                );
+                send_event(
+                    &self.events_sender,
+                    &self.proxy,
+                    SctkEvent::SubsurfaceEvent(
+                        crate::sctk_event::SubsurfaceEventVariant::Destroyed(
+                            s.instance,
+                        ),
+                    ),
+                );
+            }
+            _ = send_event(
+                &self.events_sender,
+                &self.proxy,
+                SctkEvent::PopupEvent {
+                    variant: crate::sctk_event::PopupEventVariant::Done,
+                    parent_window: popup.data.parent_window,
+                    toplevel_id: popup.data.toplevel.clone(),
+                    parent_id: popup.data.parent.wl_surface().clone(),
+                    id: popup.popup.wl_surface().clone(),
+                },
+            );
+        }
+        None
+    }
+
+    fn apply_blur(
+        &mut self,
+        id: core::window::Id,
+        rectangles: Option<Vec<Rectangle>>,
+        s: &WlSurface,
+    ) {
+        let existing_blur = self.blur_surfaces.entry(id);
+
+        match (existing_blur, rectangles) {
+            (Entry::Occupied(occupied_entry), None) => {
+                let blur_surface = occupied_entry.remove();
+                blur_surface.destroy();
+            }
+            (Entry::Occupied(mut occupied_entry), Some(rectangles)) => {
+                let blur_surface = occupied_entry.get_mut();
+                let region = self
+                    .compositor_state
+                    .wl_compositor()
+                    .create_region(&self.queue_handle, ());
+                for rect in rectangles.into_iter() {
+                    region.add(
+                        rect.x.round() as i32,
+                        rect.y.round() as i32,
+                        rect.width.round() as i32,
+                        rect.height.round() as i32,
+                    );
+                }
+
+                // update existing blur surfaces
+                blur_surface.set_blur_region(Some(&region));
+            }
+            (Entry::Vacant(..), None) => {
+                // nothing to remove
+            }
+            (Entry::Vacant(vacant_entry), Some(rectangles)) => {
+                if self.ext_background_effect_manager.is_none() {
+                    log::error!("Blur effect is not supported.");
+                    return;
+                }
+                let region = self
+                    .compositor_state
+                    .wl_compositor()
+                    .create_region(&self.queue_handle, ());
+                for rect in rectangles {
+                    region.add(
+                        rect.x.round() as i32,
+                        rect.y.round() as i32,
+                        rect.width.round() as i32,
+                        rect.height.round() as i32,
+                    );
+                }
+
+                let blur_manager =
+                    self.ext_background_effect_manager.as_mut().unwrap();
+                let blur_surface = blur_manager.blur(s, &self.queue_handle);
+                blur_surface.set_blur_region(Some(&region));
+                _ = vacant_entry.insert(blur_surface);
+            }
+        }
     }
 
     pub fn get_subsurface(
@@ -1793,12 +2018,12 @@ impl SctkState {
         ),
         SubsurfaceCreationError,
     > {
-        let Some(subsurface_state) = self.subsurface_state.as_ref() else {
+        let Some(subsurface_state) = self.subsurface_state.clone() else {
             return Err(SubsurfaceCreationError::Unsupported);
         };
         if self.layer_surfaces.iter().any(|s| s.id == settings.id)
             || self.windows.iter().any(|w| w.id == settings.id)
-            || self.popups.iter().any(|p| p.data.id == settings.id)
+            || self.popmgr.popup_id(settings.id).is_some()
             || self.subsurfaces.iter().any(|s| s.id == settings.id)
         {
             log::warn!("Subsurface with id {:?} already exists", settings.id);
@@ -1853,12 +2078,7 @@ impl SctkState {
             self.windows.iter().find(|w| w.id == settings.parent)
         {
             PopupParent::Window(parent.wl_surface(&self.connection))
-        } else if let Some(i) = self
-            .popups
-            .iter()
-            .position(|p| p.data.id == settings.parent)
-        {
-            let parent = &self.popups[i];
+        } else if let Some(parent) = self.popmgr.popup_id(settings.parent) {
             PopupParent::Popup(parent.popup.wl_surface().clone())
         } else if let Some(i) = self
             .lock_surfaces
@@ -1909,7 +2129,14 @@ impl SctkState {
             region.destroy();
         }
 
-        wl_surface.commit();
+        if let Some(old) = self.blur_surfaces.remove(&settings.id) {
+            old.destroy();
+        }
+        _ = self.corner_radii.remove(&settings.id);
+
+        if let Some(blur) = self.pending_blur.remove(&settings.id) {
+            _ = self.apply_blur(settings.id, Some(blur), &wl_surface);
+        }
 
         let wp_viewport = subsurface_state.wp_viewporter.get_viewport(
             &wl_surface,
@@ -1985,7 +2212,11 @@ impl SctkState {
         // XXX subsurfaces need to be sorted by z in descending order
         self.subsurfaces
             .sort_by(|a, b| b.instance.z.cmp(&a.instance.z));
+        if let Some(corners) = self.pending_corner_radius.remove(&id) {
+            self.handle_action(Action::RoundedCorners(id, Some(corners)));
+        }
 
+        wl_surface.commit();
         Ok((
             id,
             parent.wl_surface().clone(),
@@ -2012,3 +2243,4 @@ pub(crate) fn send_event(
 
 delegate_noop!(SctkState: ignore WlSubsurface);
 delegate_noop!(SctkState: ignore WlRegion);
+delegate_noop!(SctkState: CosmicSessionLockLayerManagerV1);

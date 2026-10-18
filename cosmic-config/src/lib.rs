@@ -4,7 +4,7 @@ use notify::event::{EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, Watcher};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::{env, fmt, fs};
@@ -48,23 +48,12 @@ fn get_state_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(home).join(".local").join("state"));
         }
     }
-    dirs::state_dir()
-}
-
-/// Get the data directory, with Flatpak sandbox support.
-fn get_data_dir() -> Option<PathBuf> {
-    // Check if we're running in Flatpak
-    if env::var_os("FLATPAK_ID").is_some() {
-        // Try HOST_XDG_DATA_HOME first
-        if let Some(host_data) = env::var_os("HOST_XDG_DATA_HOME") {
-            return Some(PathBuf::from(host_data));
-        }
-        // Fallback: try to construct from HOME
-        if let Some(home) = env::var_os("HOME") {
-            return Some(PathBuf::from(home).join(".local").join("share"));
-        }
+    if let Some(state_dir) = dirs::state_dir() {
+        return Some(state_dir);
     }
-    dirs::data_dir()
+    // On platforms without state_dir, fall back to ~/.local/state
+    let home_dir = dirs::home_dir()?;
+    Some(home_dir.join(".local").join(".state"))
 }
 
 #[cfg(feature = "subscription")]
@@ -175,6 +164,7 @@ pub trait ConfigSet {
 pub struct Config {
     system_path: Option<PathBuf>,
     user_path: Option<PathBuf>,
+    previous: Option<Box<Config>>,
 }
 
 /// Check that the name is relative and doesn't contain . or ..
@@ -193,9 +183,13 @@ fn sanitize_name(name: &str) -> Result<&Path, Error> {
 impl Config {
     /// Get a system config for the given name and config version
     pub fn system(name: &str, version: u64) -> Result<Self, Error> {
+        Self::system_inner(name, version, true)
+    }
+
+    fn system_inner(name: &str, version: u64, look_for_previous: bool) -> Result<Self, Error> {
         let path = sanitize_name(name)?.join(format!("v{version}"));
         #[cfg(unix)]
-        let system_path = xdg::BaseDirectories::with_prefix("cosmic").find_data_file(path);
+        let system_path = xdg::BaseDirectories::with_prefix("cosmic").find_data_file(&path);
 
         #[cfg(windows)]
         let system_path =
@@ -205,6 +199,13 @@ impl Config {
         Ok(Self {
             system_path,
             user_path: None,
+            previous: if version > 1 && look_for_previous {
+                Self::system_inner(name, version - 1, false)
+                    .ok()
+                    .map(Box::new)
+            } else {
+                None
+            },
         })
     }
 
@@ -212,6 +213,10 @@ impl Config {
     // Use folder at XDG config/name for config storage, return Config if successful
     //TODO: fallbacks for flatpak (HOST_XDG_CONFIG_HOME, xdg-desktop settings proxy)
     pub fn new(name: &str, version: u64) -> Result<Self, Error> {
+        Self::new_inner(name, version, true)
+    }
+
+    fn new_inner(name: &str, version: u64, look_for_previous: bool) -> Result<Self, Error> {
         // Look for [name]/v[version]
         let path = sanitize_name(name)?.join(format!("v{}", version));
 
@@ -236,15 +241,29 @@ impl Config {
         Ok(Self {
             system_path,
             user_path: Some(user_path),
+            previous: if version > 1 && look_for_previous {
+                Self::new_inner(name, version - 1, false).ok().map(Box::new)
+            } else {
+                None
+            },
         })
     }
 
     /// Get config for the given application name and config version and custom path.
     pub fn with_custom_path(name: &str, version: u64, custom_path: PathBuf) -> Result<Self, Error> {
+        Self::with_custom_path_inner(name, version, custom_path, true)
+    }
+
+    fn with_custom_path_inner(
+        name: &str,
+        version: u64,
+        custom_path: PathBuf,
+        look_for_previous: bool,
+    ) -> Result<Self, Error> {
         // Look for [name]/v[version]
         let path = sanitize_name(name)?.join(format!("v{version}"));
 
-        let mut user_path = custom_path;
+        let mut user_path = custom_path.clone();
         user_path.push("cosmic");
         user_path.push(path);
         // Create new configuration directory if not found.
@@ -254,6 +273,13 @@ impl Config {
         Ok(Self {
             system_path: None,
             user_path: Some(user_path),
+            previous: if version > 1 && look_for_previous {
+                Self::with_custom_path_inner(name, version - 1, custom_path.clone(), false)
+                    .ok()
+                    .map(Box::new)
+            } else {
+                None
+            },
         })
     }
 
@@ -263,6 +289,10 @@ impl Config {
     // Use folder at XDG config/name for config storage, return Config if successful
     //TODO: fallbacks for flatpak (HOST_XDG_CONFIG_HOME, xdg-desktop settings proxy)
     pub fn new_state(name: &str, version: u64) -> Result<Self, Error> {
+        Self::new_state_inner(name, version, true)
+    }
+
+    fn new_state_inner(name: &str, version: u64, look_for_previous: bool) -> Result<Self, Error> {
         // Look for [name]/v[version]
         let path = sanitize_name(name)?.join(format!("v{}", version));
 
@@ -276,24 +306,13 @@ impl Config {
         Ok(Self {
             system_path: None,
             user_path: Some(user_path),
-        })
-    }
-
-    /// Get data for the given application name and config version.
-    pub fn new_data(name: &str, version: u64) -> Result<Self, Error> {
-        // Look for [name]/v[version]
-        let path = sanitize_name(name)?.join(format!("v{}", version));
-
-        // Get libcosmic user data directory
-        let mut user_path = get_data_dir().ok_or(Error::NoConfigDirectory)?;
-        user_path.push("cosmic");
-        user_path.push(path);
-        // Create new data directory if not found.
-        fs::create_dir_all(&user_path)?;
-
-        Ok(Self {
-            system_path: None,
-            user_path: Some(user_path),
+            previous: if version > 1 && look_for_previous {
+                Self::new_state_inner(name, version - 1, false)
+                    .ok()
+                    .map(Box::new)
+            } else {
+                None
+            },
         })
     }
 
@@ -398,22 +417,31 @@ impl ConfigGet for Config {
         match self.key_path(key) {
             Ok(key_path) if key_path.is_file() => {
                 // Load user override
-                let data = fs::read_to_string(key_path)
-                    .map_err(|err| Error::GetKey(key.to_string(), err))?;
-
-                Ok(ron::from_str(&data)?)
+                match fs::read_to_string(key_path) {
+                    Ok(data) => Ok(ron::from_str(&data)?),
+                    Err(why) if why.kind() == io::ErrorKind::NotFound => Err(Error::NotFound),
+                    Err(why) => Err(Error::GetKey(key.to_string(), why)),
+                }
             }
 
-            _ => Err(Error::NotFound),
+            _ => {
+                if let Some(previous) = self.previous.as_ref() {
+                    previous.get_local(key)
+                } else {
+                    Err(Error::NotFound)
+                }
+            }
         }
     }
 
     fn get_system_default<T: DeserializeOwned>(&self, key: &str) -> Result<T, Error> {
         // Load system default
         let default_path = self.default_path(key)?;
-        let data =
-            fs::read_to_string(default_path).map_err(|err| Error::GetKey(key.to_string(), err))?;
-        Ok(ron::from_str(&data)?)
+        match fs::read_to_string(default_path) {
+            Ok(data) => Ok(ron::from_str(&data)?),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Err(Error::NotFound),
+            Err(why) => Err(Error::GetKey(key.to_string(), why)),
+        }
     }
 }
 

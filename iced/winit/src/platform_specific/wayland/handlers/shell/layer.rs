@@ -1,13 +1,13 @@
 use crate::platform_specific::wayland::{
-    event_loop::state::{receive_frame, SctkState},
+    event_loop::state::{SctkState, receive_frame},
     sctk_event::{LayerSurfaceEventVariant, SctkEvent},
 };
 use cctk::sctk::{
     delegate_layer,
     reexports::client::Proxy,
     shell::{
-        wlr_layer::{Anchor, KeyboardInteractivity, LayerShellHandler},
         WaylandSurface,
+        wlr_layer::{Anchor, KeyboardInteractivity, LayerShellHandler},
     },
 };
 use std::fmt::Debug;
@@ -26,6 +26,15 @@ impl LayerShellHandler for SctkState {
             Some(w) => self.layer_surfaces.remove(w),
             None => return,
         };
+
+        if let Some(id) = self.id_map.remove(&layer.surface.wl_surface().id()) {
+            if let Some(blurred) = self.blur_surfaces.remove(&id) {
+                blurred.destroy();
+            }
+            _ = self.corner_radii.remove(&id);
+
+            _ = self.destroyed.insert(id);
+        }
 
         self.sctk_events.push(SctkEvent::LayerSurfaceEvent {
             variant: LayerSurfaceEventVariant::Done,

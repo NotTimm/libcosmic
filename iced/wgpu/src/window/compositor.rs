@@ -9,16 +9,10 @@ use crate::graphics::{self, Shell, Viewport};
 use crate::settings::{self, Settings};
 use crate::{Engine, Renderer};
 
-#[cfg(all(
-    unix,
-    feature = "cctk",
-    not(target_os = "macos"),
-    not(target_os = "redox")
-))]
+#[cfg(wayland_platform)]
 use super::wayland::get_wayland_device_ids;
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
+#[cfg(wayland_platform)]
 use super::x11::get_x11_device_ids;
-use std::future::Future;
 
 /// A window graphics backend for iced powered by `wgpu`.
 pub struct Compositor {
@@ -65,26 +59,11 @@ impl Compositor {
         compatible_window: Option<W>,
         shell: Shell,
     ) -> Result<Self, Error> {
-        #[cfg(all(
-            unix,
-            feature = "cctk",
-            not(target_os = "macos"),
-            not(target_os = "redox")
-        ))]
+        #[cfg(wayland_platform)]
         let ids = compatible_window.as_ref().and_then(|window| {
             get_wayland_device_ids(window)
                 .or_else(|| get_x11_device_ids(window))
         });
-
-        #[cfg(all(
-            unix,
-            not(feature = "cctk"),
-            not(target_os = "macos"),
-            not(target_os = "redox")
-        ))]
-        let ids = compatible_window
-            .as_ref()
-            .and_then(|window| get_x11_device_ids(window));
 
         // HACK:
         //  1. If we specifically didn't select an nvidia gpu
@@ -92,7 +71,7 @@ impl Compositor {
         //  3. and the user didn't set an adapter name,
         //  4. and the user didn't request the high power pref
         // => don't load the nvidia icd, as it might power on the gpu in hybrid setups causing severe delays
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "redox")))]
+        #[cfg(wayland_platform)]
         if !matches!(ids, Some((0x10de, _)))
             && std::env::var_os("__NV_PRIME_RENDER_OFFLOAD")
                 .is_none_or(|var| var == "0")
@@ -152,11 +131,7 @@ impl Compositor {
         let mut adapter = None;
         #[cfg_attr(not(unix), allow(dead_code))]
         if std::env::var_os("WGPU_ADAPTER_NAME").is_none() {
-            #[cfg(all(
-                unix,
-                not(target_os = "macos"),
-                not(target_os = "redox")
-            ))]
+            #[cfg(wayland_platform)]
             if let Some((vendor_id, device_id)) = ids {
                 adapter = instance
                     .enumerate_adapters(settings.backends)
@@ -296,11 +271,12 @@ impl Compositor {
         });
 
         // Request SHADER_F16 only if the adapter supports it (e.g., not available in WebGL2)
-        let required_features = if adapter.features().contains(wgpu::Features::SHADER_F16) {
-            wgpu::Features::SHADER_F16
-        } else {
-            wgpu::Features::empty()
-        };
+        let required_features =
+            if adapter.features().contains(wgpu::Features::SHADER_F16) {
+                wgpu::Features::SHADER_F16
+            } else {
+                wgpu::Features::empty()
+            };
 
         let mut errors = Vec::new();
 

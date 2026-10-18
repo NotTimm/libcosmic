@@ -44,13 +44,13 @@ pub fn popup_dropdown<
     selected: Option<usize>,
     on_selected: impl Fn(usize) -> Message + Send + Sync + 'static,
     _parent_id: window::Id,
-    _on_surface_action: impl Fn(surface::Action) -> Message + Send + Sync + 'static,
+    _on_surface_action: impl Fn(surface::Action<AppMessage>) -> Message + Send + Sync + 'static,
     _map_action: impl Fn(Message) -> AppMessage + Send + Sync + 'static,
 ) -> Dropdown<'a, S, Message, AppMessage> {
     let dropdown: Dropdown<'_, S, Message, AppMessage> =
         Dropdown::new(selections.into(), selected, on_selected);
 
-    #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     let dropdown = dropdown.with_popup(_parent_id, _on_surface_action, _map_action);
 
     dropdown

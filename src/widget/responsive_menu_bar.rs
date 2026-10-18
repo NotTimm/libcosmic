@@ -23,7 +23,7 @@ impl Default for ResponsiveMenuBar {
     fn default() -> ResponsiveMenuBar {
         ResponsiveMenuBar {
             collapsed_item_width: {
-                #[cfg(all(feature = "winit", feature = "wayland", target_os = "linux"))]
+                #[cfg(wayland_platform)]
                 if matches!(
                     crate::app::cosmic::WINDOWING_SYSTEM.get(),
                     Some(crate::app::cosmic::WindowingSystem::Wayland)
@@ -32,13 +32,13 @@ impl Default for ResponsiveMenuBar {
                 } else {
                     ItemWidth::Static(84)
                 }
-                #[cfg(not(all(feature = "winit", feature = "wayland", target_os = "linux")))]
+                #[cfg(not(wayland_platform))]
                 {
                     ItemWidth::Static(84)
                 }
             },
             item_width: ItemWidth::Uniform(150),
-            item_height: ItemHeight::Uniform(30),
+            item_height: ItemHeight::Dynamic(40),
             spacing: 0.,
         }
     }
@@ -79,7 +79,11 @@ impl ResponsiveMenuBar {
         core: &Core,
         key_binds: &HashMap<menu::KeyBind, A>,
         id: crate::widget::Id,
-        action_message: impl Fn(crate::surface::Action) -> Message + Send + Sync + Clone + 'static,
+        action_message: impl Fn(crate::surface::Action<Message>) -> Message
+        + Send
+        + Sync
+        + Clone
+        + 'static,
         trees: Vec<(S, Vec<menu::Item<A, S>>)>,
     ) -> Element<'a, Message> {
         use crate::widget::id_container;

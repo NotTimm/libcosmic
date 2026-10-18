@@ -191,6 +191,7 @@ where
             dyn FnMut(
                 &dyn winit::window::Window,
                 &winit::event::WindowEvent,
+                mouse::Interaction,
             ) -> bool,
         >,
     >,
@@ -291,11 +292,11 @@ where
     pub fn update_mouse(&mut self, interaction: mouse::Interaction) {
         if interaction != self.mouse_interaction {
             if let Some(icon) = conversion::mouse_interaction(interaction) {
-                self.raw.set_cursor(icon.into());
-
                 if self.mouse_interaction == mouse::Interaction::Hidden {
                     self.raw.set_cursor_visible(true);
                 }
+
+                self.raw.set_cursor(icon.into());
             } else {
                 self.raw.set_cursor_visible(false);
             }

@@ -1,6 +1,6 @@
 //! Show a circular progress indicator.
 use super::animation::{Animation, Progress};
-use super::style::StyleSheet;
+use super::style::{self, Catalog};
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{self, Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::widget::canvas;
@@ -15,11 +15,11 @@ const MAX_WRAP: f32 = 1.0 - MIN_GAP_ANGLE.0 / (2.0 * PI);
 #[must_use]
 pub struct Circular<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog,
 {
     size: f32,
-    bar_height: f32,
-    style: Theme::Style,
+    bar_height: Option<f32>,
+    class: Theme::Class,
     cycle_duration: Duration,
     period: Duration,
     progress: Option<f32>,
@@ -27,14 +27,14 @@ where
 
 impl<Theme> Circular<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog<Class = style::Class>,
 {
     /// Creates a new [`Circular`] with the given content.
     pub fn new() -> Self {
         Circular {
-            size: 40.0,
-            bar_height: 4.0,
-            style: Theme::Style::default(),
+            size: 48.0,
+            bar_height: None,
+            class: Theme::Class::default(),
             cycle_duration: Duration::from_millis(1500),
             period: Duration::from_secs(2),
             progress: None,
@@ -48,14 +48,15 @@ where
     }
 
     /// Sets the bar height of the [`Circular`].
+    /// By default, the height is based on the size of the [`Circular`].
     pub fn bar_height(mut self, bar_height: f32) -> Self {
-        self.bar_height = bar_height;
+        self.bar_height = Some(bar_height);
         self
     }
 
-    /// Sets the style variant of this [`Circular`].
-    pub fn style(mut self, style: Theme::Style) -> Self {
-        self.style = style;
+    /// Sets the style class of this [`Circular`].
+    pub fn class(mut self, class: Theme::Class) -> Self {
+        self.class = class;
         self
     }
 
@@ -77,11 +78,29 @@ where
         self.progress = Some(progress.clamp(0.0, 1.0));
         self
     }
+
+    /// Sets the track color of this [`Circular`].
+    pub fn track_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.track_color(color);
+        self
+    }
+
+    /// Sets the bar color of this [`Circular`].
+    pub fn bar_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.bar_color(color);
+        self
+    }
+
+    /// Sets the border color of this [`Circular`].
+    pub fn border_color(mut self, color: impl Into<iced::Color>) -> Self {
+        self.class = self.class.border_color(color);
+        self
+    }
 }
 
 impl<Theme> Default for Circular<Theme>
 where
-    Theme: StyleSheet,
+    Theme: Catalog<Class = style::Class>,
 {
     fn default() -> Self {
         Self::new()
@@ -98,7 +117,7 @@ struct State {
 impl<Message, Theme> Widget<Message, Theme, Renderer> for Circular<Theme>
 where
     Message: Clone,
-    Theme: StyleSheet,
+    Theme: Catalog,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -169,44 +188,44 @@ where
 
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        let custom_style = Theme::appearance(theme, &self.style, self.progress.is_some(), true);
+        let custom_style = theme.style(&self.class, self.progress.is_some(), true);
 
         let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
-            let track_radius = frame.width() / 2.0 - self.bar_height;
+            let bar_height = self.bar_height.unwrap_or((frame.width() / 12.0).max(2.0));
+            let track_radius = (frame.width() - bar_height) / 2.0;
             if track_radius <= 0.0 {
                 return;
             }
-            let track_path = canvas::Path::circle(frame.center(), track_radius);
 
+            let track_path = canvas::Path::circle(frame.center(), track_radius);
             frame.stroke(
                 &track_path,
                 canvas::Stroke::default()
                     .with_color(custom_style.track_color)
-                    .with_width(self.bar_height),
+                    .with_width(bar_height),
             );
 
-            // Converts a track fraction to an angle in radians, with 0 being top of circle
-            let to_angle = |t: f32| t * 2.0 * PI - PI / 2.0;
             let draw_bar = |frame: &mut canvas::Frame, start: f32, end: f32| {
                 let mut builder = canvas::path::Builder::new();
                 builder.arc(canvas::path::Arc {
                     center: frame.center(),
                     radius: track_radius,
-                    start_angle: Radians(to_angle(start)),
-                    end_angle: Radians(to_angle(end)),
+                    start_angle: Radians(2.0 * PI * start - PI / 2.0),
+                    end_angle: Radians(2.0 * PI * end - PI / 2.0),
                 });
                 frame.stroke(
                     &builder.build(),
                     canvas::Stroke::default()
                         .with_color(custom_style.bar_color)
-                        .with_width(self.bar_height)
+                        .with_width(bar_height)
                         .with_line_cap(canvas::LineCap::Round),
                 );
             };
 
             if self.progress.is_some() {
                 if let Some(border_color) = custom_style.border_color {
-                    for radius_offset in [self.bar_height / 2.0, -(self.bar_height / 2.0)] {
+                    // - 0.5 ensures the border is inside the track
+                    for radius_offset in [bar_height / 2.0 - 0.5, -(bar_height / 2.0 - 0.5)] {
                         let border_path =
                             canvas::Path::circle(frame.center(), track_radius + radius_offset);
                         frame.stroke(
@@ -239,7 +258,7 @@ where
 impl<'a, Message, Theme> From<Circular<Theme>> for Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
-    Theme: StyleSheet + 'a,
+    Theme: Catalog + 'a,
 {
     fn from(circular: Circular<Theme>) -> Self {
         Self::new(circular)

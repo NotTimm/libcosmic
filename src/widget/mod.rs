@@ -89,8 +89,9 @@ pub use iced::widget::{Slider, VerticalSlider, slider, vertical_slider};
 #[doc(inline)]
 pub use iced::widget::{Svg, svg};
 
+pub mod text_editor;
 #[doc(inline)]
-pub use iced::widget::{TextEditor, text_editor};
+pub use text_editor::TextEditor;
 
 #[doc(inline)]
 pub use iced_core::widget::{Id, Operation, Widget};
@@ -295,6 +296,14 @@ pub mod text;
 #[doc(inline)]
 pub use text::{Text, text};
 
+pub mod selectable_text;
+#[doc(inline)]
+pub use selectable_text::{SelectableText, selectable_text};
+
+pub mod text_context_menu;
+#[doc(inline)]
+pub use text_context_menu::HasSelectableText;
+
 pub mod text_input;
 #[doc(inline)]
 pub use text_input::{
@@ -312,7 +321,7 @@ pub use toggler::{Toggler, toggler};
 #[doc(inline)]
 pub use tooltip::{Tooltip, tooltip};
 
-#[cfg(all(feature = "wayland", target_os = "linux", feature = "winit"))]
+#[cfg(wayland_platform)]
 pub mod wayland;
 
 pub mod tooltip {

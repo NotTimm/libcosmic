@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::widget::container::Catalog;
-use crate::widget::space::vertical;
-use crate::widget::{DndDestination, DndSource, button, column, container, divider, row};
+use crate::widget::{DndDestination, DndSource, button, column, container, divider, row, space};
 use crate::{Apply, Element, theme};
 use iced::{Length, Padding};
 
@@ -173,9 +172,8 @@ impl<'a, Message: Clone + 'static> ListColumn<'a, Message> {
         let mut col = column::with_capacity((2 * count).saturating_sub(1));
 
         // Ensure minimum height of 32
-        let content_row = |content| {
-            row![container(content), vertical().height(32)].align_y(iced::Alignment::Center)
-        };
+        let content_row =
+            |content| row![container(content), space().height(32)].align_y(iced::Alignment::Center);
 
         for (
             i,

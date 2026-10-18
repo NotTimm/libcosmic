@@ -28,8 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 pub enum Message {
     Clicked,
     WindowClose,
-    Surface(cosmic::surface::Action),
+    Surface(cosmic::surface::Action<Message>),
     ToggleHideContent,
+    ToggleSomeAction,
     WindowNew,
 }
 
@@ -82,18 +83,18 @@ impl cosmic::Application for App {
 
     /// Handle application events here.
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
+        tracing::error!("Clicked {message:?}");
         match message {
             Message::Clicked => {
                 self.button_label = format!("Clicked {message:?}");
             }
             Message::Surface(action) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(action),
-                ));
+                return cosmic::task::message(cosmic::Action::Surface(action));
             }
-            Message::WindowClose => {}
-            Message::ToggleHideContent => {}
-            Message::WindowNew => {}
+            Message::WindowClose
+            | Message::ToggleHideContent
+            | Message::ToggleSomeAction
+            | Message::WindowNew => {}
         }
 
         Task::none()
@@ -102,7 +103,7 @@ impl cosmic::Application for App {
     /// Creates a view after each update.
     fn view(&self) -> Element<'_, Self::Message> {
         let widget = cosmic::widget::context_menu(
-            cosmic::widget::button::text(self.button_label.to_string()).on_press(Message::Clicked),
+            cosmic::widget::button::text(self.button_label.clone()).on_press(Message::Clicked),
             self.context_menu(),
         )
         .on_surface_action(Message::Surface);
@@ -126,12 +127,20 @@ impl App {
                 menu::Item::Divider,
                 menu::Item::Folder(
                     "View",
-                    vec![menu::Item::CheckBox(
-                        "Hide content",
-                        None,
-                        self.hide_content,
-                        ContextMenuAction::ToggleHideContent,
-                    )],
+                    vec![
+                        menu::Item::CheckBox(
+                            "Hide content",
+                            None,
+                            self.hide_content,
+                            ContextMenuAction::ToggleHideContent,
+                        ),
+                        menu::Item::CheckBox(
+                            "Test content",
+                            None,
+                            self.hide_content,
+                            ContextMenuAction::ToggleSomeAction,
+                        ),
+                    ],
                 ),
                 menu::Item::Divider,
                 menu::Item::Button("Quit", None, ContextMenuAction::WindowClose),
@@ -144,6 +153,7 @@ impl App {
 pub enum ContextMenuAction {
     WindowClose,
     ToggleHideContent,
+    ToggleSomeAction,
     WindowNew,
 }
 
@@ -153,6 +163,7 @@ impl menu::Action for ContextMenuAction {
         match self {
             ContextMenuAction::WindowClose => Message::WindowClose,
             ContextMenuAction::ToggleHideContent => Message::ToggleHideContent,
+            ContextMenuAction::ToggleSomeAction => Message::ToggleSomeAction,
             ContextMenuAction::WindowNew => Message::WindowNew,
         }
     }

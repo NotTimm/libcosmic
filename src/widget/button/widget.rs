@@ -6,6 +6,7 @@
 //!
 //! A [`Button`] has some local [`State`].
 
+use iced::Alignment;
 use iced_runtime::core::widget::Id;
 use iced_runtime::{Action, Task, keyboard, task};
 
@@ -449,7 +450,7 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
 
         let state = tree.state.downcast_ref::<State>();
 
-        let styling = if !is_enabled {
+        let mut styling = if !is_enabled {
             theme.disabled(&self.style)
         } else if is_mouse_over {
             if state.is_pressed {
@@ -471,6 +472,24 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
 
             theme.active(state.is_focused, self.selected, &self.style)
         };
+        if matches!(
+            self.style,
+            crate::theme::Button::MenuItem | crate::theme::Button::MenuFolder
+        ) {
+            match theme.list_item_position {
+                Some((Alignment::Start, _)) => {
+                    styling.border_radius =
+                        styling.border_radius.bottom(theme.cosmic().radius_0()[3]);
+                }
+                Some((Alignment::End, _)) => {
+                    styling.border_radius = styling.border_radius.top(theme.cosmic().radius_0()[0]);
+                }
+                Some((Alignment::Center, _)) => {}
+                None => {
+                    styling.border_radius = theme.cosmic().radius_0().into();
+                }
+            }
+        }
 
         let mut icon_color = styling.icon_color.unwrap_or(renderer_style.icon_color);
 
@@ -787,6 +806,7 @@ pub fn update<'a, Message: Clone>(
 
                 if cursor.is_over(bounds) {
                     state.is_pressed = true;
+                    shell.request_redraw();
 
                     if let Some(on_press_down) = on_press_down {
                         let msg = (on_press_down)(layout.virtual_offset(), layout.bounds());
@@ -818,7 +838,10 @@ pub fn update<'a, Message: Clone>(
                 }
             } else if on_press_down.is_some() {
                 let state = state();
-                state.is_pressed = false;
+                if state.is_pressed {
+                    state.is_pressed = false;
+                    shell.request_redraw();
+                }
             }
         }
         #[cfg(feature = "a11y")]
@@ -849,8 +872,21 @@ pub fn update<'a, Message: Clone>(
                 }
             }
         }
+        Event::Mouse(mouse::Event::CursorMoved { .. })
+        | Event::Touch(touch::Event::FingerMoved { .. }) => {
+            let state = state();
+            let is_hovered = cursor.is_over(layout.bounds());
+            if state.is_hovered != is_hovered {
+                state.is_hovered = is_hovered;
+                shell.request_redraw();
+            }
+        }
         Event::Touch(touch::Event::FingerLost { .. }) | Event::Mouse(mouse::Event::CursorLeft) => {
             let state = state();
+
+            if state.is_hovered || state.is_pressed {
+                shell.request_redraw();
+            }
             state.is_hovered = false;
             state.is_pressed = false;
         }

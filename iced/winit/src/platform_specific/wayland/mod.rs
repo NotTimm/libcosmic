@@ -20,31 +20,20 @@ use iced_graphics::{Compositor, compositor};
 use iced_runtime::core::{Vector, window};
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle};
 use raw_window_handle::{HasRawDisplayHandle, RawWindowHandle};
-use sctk_event::SctkEvent;
+use sctk_event::{PopupEventVariant, SctkEvent};
+use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 use subsurface_widget::{SubsurfaceInstance, SubsurfaceState};
 use wayland_backend::client::ObjectId;
 use wayland_client::{Connection, Proxy};
-use std::sync::OnceLock;
 use winit::dpi::Size;
 use winit::event_loop::OwnedDisplayHandle;
 use winit::window::ImePurpose;
 
-static SCTK_ACTION_SENDER: OnceLock<calloop::channel::Sender<Action>> = OnceLock::new();
-
-/// Sends a platform-specific wayland action directly to the SCTK event loop,
-/// bypassing the async Task system. This is needed when widgets queue popup
-/// actions outside of the normal message flow (e.g., text context menus that
-/// don't publish app messages).
-pub fn send_wayland_action_direct(action: iced_runtime::platform_specific::wayland::Action) {
-    if let Some(sender) = SCTK_ACTION_SENDER.get() {
-        _ = sender.send(Action::Action(action));
-    }
-}
-
 pub(crate) enum Action {
     Action(iced_runtime::platform_specific::wayland::Action),
-    SetCursor(CursorIcon),
+    SetCursor(ObjectId, CursorIcon),
+    SetCursorVisible(ObjectId, bool),
     RequestRedraw(ObjectId),
     TrackWindow(Arc<dyn winit::window::Window>, window::Id),
     ResizeWindow(window::Id),
@@ -60,9 +49,14 @@ impl std::fmt::Debug for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Action(arg0) => f.debug_tuple("Action").field(arg0).finish(),
-            Self::SetCursor(arg0) => {
-                f.debug_tuple("SetCursor").field(arg0).finish()
+            Self::SetCursor(arg0, arg1) => {
+                f.debug_tuple("SetCursor").field(arg0).field(arg1).finish()
             }
+            Self::SetCursorVisible(arg0, arg1) => f
+                .debug_tuple("SetCursorVisible")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
             Self::RequestRedraw(arg0) => {
                 f.debug_tuple("RequestRedraw").field(arg0).finish()
             }
@@ -109,6 +103,7 @@ pub(crate) struct WaylandSpecific {
     surface_ids: HashMap<ObjectId, SurfaceIdWrapper>,
     subsurface_state: Option<SubsurfaceState>,
     surface_subsurfaces: HashMap<window::Id, Vec<SubsurfaceInstance>>,
+    popup_toplevels: HashMap<ObjectId, window::Id>,
 }
 
 impl PlatformSpecific {
@@ -141,7 +136,6 @@ impl PlatformSpecific {
         };
         self.wayland.display_handle = Some(display);
         self.wayland.proxy = Some(raw);
-        // TODO remove this
         self.wayland.sender =
             crate::platform_specific::event_loop::SctkEventLoop::new(
                 self.wayland.winit_event_sender.clone().unwrap(),
@@ -149,9 +143,6 @@ impl PlatformSpecific {
                 self.wayland.display_handle.clone().unwrap(),
             )
             .ok();
-        if let Some(ref sender) = self.wayland.sender {
-            _ = SCTK_ACTION_SENDER.set(sender.clone());
-        }
         self
     }
 
@@ -183,6 +174,11 @@ impl WaylandSpecific {
         self.conn.as_ref()
     }
 
+    /// Whether a popup opened from `toplevel` is alive.
+    pub(crate) fn has_popup(&self, toplevel: window::Id) -> bool {
+        self.popup_toplevels.values().any(|id| *id == toplevel)
+    }
+
     pub(crate) async fn handle_event<'a, 'b, P>(
         &mut self,
         e: SctkEvent,
@@ -211,7 +207,32 @@ impl WaylandSpecific {
             modifiers,
             subsurface_state,
             surface_subsurfaces,
+            popup_toplevels,
         } = self;
+
+        if let SctkEvent::PopupEvent {
+            variant,
+            parent_id,
+            parent_window,
+            id,
+            ..
+        } = &e
+        {
+            match variant {
+                PopupEventVariant::Created(..) => {
+                    // A nested popup's parent is itself a popup so inhreit its toplevel
+                    let toplevel = popup_toplevels
+                        .get(&parent_id.id())
+                        .copied()
+                        .unwrap_or(*parent_window);
+                    _ = popup_toplevels.insert(id.id(), toplevel);
+                }
+                PopupEventVariant::Done => {
+                    _ = popup_toplevels.remove(&id.id());
+                }
+                _ => {}
+            }
+        }
 
         match e {
             sctk_event => {

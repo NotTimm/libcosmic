@@ -5,7 +5,7 @@ use crate::config::CosmicTk;
 use crate::theme::Theme;
 use crate::widget::nav_bar;
 use crate::{keyboard_nav, surface};
-#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[cfg(wayland_platform)]
 use cctk::sctk::reexports::csd_frame::{WindowManagerCapabilities, WindowState};
 use cosmic_theme::ThemeMode;
 
@@ -45,8 +45,6 @@ pub enum Action {
     /// Tracks updates to window suggested size.
     #[cfg(feature = "applet")]
     SuggestedBounds(Option<iced::Size>),
-    /// Internal surface message
-    Surface(surface::Action),
     /// Notifies that a surface was closed.
     /// Any data relating to the surface should be cleaned up.
     SurfaceClosed(iced::window::Id),
@@ -64,16 +62,18 @@ pub enum Action {
     Unfocus(iced::window::Id),
     /// Windowing system initialized
     WindowingSystemInitialized,
+    /// Blur support enabled
+    BlurEnabled,
     /// Updates the window maximized state
     WindowMaximized(iced::window::Id, bool),
     /// Updates the tracked window geometry.
     WindowResize(iced::window::Id, f32, f32),
     /// Tracks updates to window state.
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     WindowState(iced::window::Id, WindowState),
     /// Capabilities the window manager supports
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     WmCapabilities(iced::window::Id, WindowManagerCapabilities),
-    #[cfg(feature = "xdg-portal")]
+    #[cfg(xdg_portal)]
     DesktopSettings(crate::theme::portal::Desktop),
 }

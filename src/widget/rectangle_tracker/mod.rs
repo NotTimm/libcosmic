@@ -5,7 +5,7 @@ use iced::futures::channel::mpsc::UnboundedSender;
 use iced::widget::Container;
 pub use subscription::*;
 
-use iced_core::event::{self, Event};
+use iced_core::event::Event;
 use iced_core::widget::Tree;
 use iced_core::{
     Alignment, Clipboard, Element, Layout, Length, Padding, Rectangle, Shell, Widget, layout,
@@ -22,15 +22,15 @@ pub fn rectangle_tracking_container<'a, Message, I, T>(
     tx: UnboundedSender<(I, Rectangle)>,
 ) -> RectangleTrackingContainer<'a, Message, crate::Renderer, I>
 where
-    I: Hash + Copy + Send + Sync + Debug + 'a,
+    I: Hash + Clone + Send + Sync + Debug + 'a,
     T: Into<Element<'a, Message, crate::Theme, crate::Renderer>>,
 {
     RectangleTrackingContainer::new(content, id, tx)
 }
 
 pub fn subscription<
-    I: 'static + Hash + Copy + Send + Sync + Debug,
-    R: 'static + Hash + Copy + Send + Sync + Debug + Eq,
+    I: 'static + Hash + Clone + Send + Sync + Debug,
+    R: 'static + Hash + Clone + Send + Sync + Debug + Eq,
 >(
     id: I,
 ) -> iced::Subscription<(I, RectangleUpdate<R>)> {
@@ -44,7 +44,7 @@ pub struct RectangleTracker<I> {
 
 impl<I> RectangleTracker<I>
 where
-    I: Hash + Copy + Send + Sync + Debug,
+    I: Hash + Clone + Send + Sync + Debug,
 {
     pub fn container<'a, Message: 'static, T>(
         &self,
@@ -76,7 +76,7 @@ where
 impl<'a, Message, Renderer, I> RectangleTrackingContainer<'a, Message, Renderer, I>
 where
     Renderer: iced_core::Renderer,
-    I: 'a + Hash + Copy + Send + Sync + Debug,
+    I: 'a + Hash + Clone + Send + Sync + Debug,
 {
     /// Creates an empty [`Container`].
     pub(crate) fn new<T>(content: T, id: I, tx: UnboundedSender<(I, Rectangle)>) -> Self
@@ -185,7 +185,7 @@ impl<'a, Message, Renderer, I> Widget<Message, crate::Theme, Renderer>
     for RectangleTrackingContainer<'a, Message, Renderer, I>
 where
     Renderer: iced_core::Renderer,
-    I: 'a + Hash + Copy + Send + Sync + Debug,
+    I: 'a + Hash + Clone + Send + Sync + Debug,
 {
     fn children(&self) -> Vec<Tree> {
         self.container.children()
@@ -275,7 +275,7 @@ where
         cursor_position: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let _ = self.tx.unbounded_send((self.id, layout.bounds()));
+        let _ = self.tx.unbounded_send((self.id.clone(), layout.bounds()));
         self.container.draw(
             tree,
             renderer,
@@ -327,7 +327,7 @@ impl<'a, Message, Renderer, I> From<RectangleTrackingContainer<'a, Message, Rend
 where
     Message: 'a,
     Renderer: 'a + iced_core::Renderer,
-    I: 'a + Hash + Copy + Send + Sync + Debug,
+    I: 'a + Hash + Clone + Send + Sync + Debug,
 {
     fn from(
         column: RectangleTrackingContainer<'a, Message, Renderer, I>,

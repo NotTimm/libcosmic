@@ -499,13 +499,30 @@ where
                     let new_hovered_option = (cursor_position.y / option_height) as usize;
                     let mut hovered_guard = self.hovered_option.lock().unwrap();
 
-                    if let Some(on_option_hovered) = self.on_option_hovered {
-                        if *hovered_guard != Some(new_hovered_option) {
+                    if *hovered_guard != Some(new_hovered_option) {
+                        shell.request_redraw();
+
+                        if let Some(on_option_hovered) = self.on_option_hovered {
                             shell.publish(on_option_hovered(new_hovered_option));
                         }
                     }
 
                     *hovered_guard = Some(new_hovered_option);
+                } else {
+                    let mut hovered_guard = self.hovered_option.lock().unwrap();
+
+                    if hovered_guard.is_some() {
+                        *hovered_guard = None;
+                        shell.request_redraw();
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                let mut hovered_guard = self.hovered_option.lock().unwrap();
+
+                if hovered_guard.is_some() {
+                    *hovered_guard = None;
+                    shell.request_redraw();
                 }
             }
             Event::Touch(touch::Event::FingerPressed { .. }) => {

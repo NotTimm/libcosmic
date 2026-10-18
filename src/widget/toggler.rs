@@ -249,8 +249,8 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         }
 
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerPressed { .. }) => {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Touch(touch::Event::FingerLifted { .. }) => {
                 let mouse_over = cursor_position.is_over(layout.bounds());
 
                 if mouse_over {
@@ -266,6 +266,17 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
                     shell.request_redraw();
                 }
             }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let toggler_bounds = layout
+                    .children()
+                    .nth(1)
+                    .map_or_else(|| layout.bounds(), |l| l.bounds());
+                let hovered = cursor_position.is_over(toggler_bounds);
+                if state.hovered != hovered {
+                    state.hovered = hovered;
+                    shell.request_redraw();
+                }
+            }
             _ => {}
         }
     }
@@ -278,7 +289,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         _viewport: &Rectangle,
         _renderer: &crate::Renderer,
     ) -> mouse::Interaction {
-        if cursor_position.is_over(layout.bounds()) {
+        if self.on_toggle.is_some() && cursor_position.is_over(layout.bounds()) {
             mouse::Interaction::Pointer
         } else {
             mouse::Interaction::default()
@@ -339,7 +350,11 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
 
         let style = theme.style(
             &(),
-            if is_mouse_over {
+            if self.on_toggle.is_none() {
+                Status::Disabled {
+                    is_toggled: self.is_toggled,
+                }
+            } else if is_mouse_over {
                 Status::Hovered {
                     is_toggled: self.is_toggled,
                 }
@@ -442,4 +457,5 @@ pub struct State {
     text: widget::text::State<<crate::Renderer as iced_core::text::Renderer>::Paragraph>,
     anim: anim::State,
     prev_toggled: bool,
+    hovered: bool,
 }

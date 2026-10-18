@@ -40,12 +40,6 @@ pub mod clipboard;
 pub mod conversion;
 pub mod platform_specific;
 
-#[cfg(feature = "program")]
-pub mod program;
-
-#[cfg(feature = "system")]
-pub mod system;
-
 mod error;
 mod proxy;
 mod window;
@@ -53,7 +47,6 @@ mod window;
 pub use clipboard::Clipboard;
 pub use error::Error;
 pub use proxy::Proxy;
-use winit::dpi::LogicalSize;
 use winit::dpi::PhysicalPosition;
 use winit::dpi::PhysicalSize;
 
@@ -76,6 +69,8 @@ use crate::runtime::user_interface::{self, UserInterface};
 use crate::runtime::{Action, Task};
 
 use program::Program;
+#[cfg(feature = "program")]
+pub use program::Program;
 use window::WindowManager;
 
 use rustc_hash::FxHashMap;
@@ -98,10 +93,10 @@ where
 
     let event_loop = EventLoop::new().expect("Create event loop");
 
-    #[cfg(all(feature = "cctk", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     let is_wayland =
         winit::platform::wayland::EventLoopExtWayland::is_wayland(&event_loop);
-    #[cfg(not(all(feature = "cctk", target_os = "linux")))]
+    #[cfg(not(wayland_platform))]
     let is_wayland = false;
 
     // TODO this is new..
@@ -193,10 +188,13 @@ where
         error: Option<Error>,
         system_theme: Option<oneshot::Sender<theme::Mode>>,
         control_sender: mpsc::UnboundedSender<Control>,
-        
+
         #[cfg(feature = "a11y")]
-        adapters: std::collections::HashMap<window::Id, (u64, iced_accessibility::accesskit_winit::Adapter)>,
-    
+        adapters: std::collections::HashMap<
+            window::Id,
+            (u64, iced_accessibility::accesskit_winit::Adapter),
+        >,
+
         #[cfg(target_arch = "wasm32")]
         is_booted: std::rc::Rc<std::cell::RefCell<bool>>,
         #[cfg(target_arch = "wasm32")]
@@ -263,7 +261,7 @@ where
                     | winit::event::WindowEvent::Moved(_)
             );
 
-            #[cfg(all(feature = "cctk", target_os = "linux"))]
+            #[cfg(wayland_platform)]
             {
                 if matches!(event, WindowEvent::RedrawRequested) {
                     for id in
@@ -501,9 +499,15 @@ where
                                         }
                                     };
                                 }
-                                let window: Arc<dyn winit::window::Window + 'static> = Arc::from(window);
+                                let window: Arc<
+                                    dyn winit::window::Window + 'static,
+                                > = Arc::from(window);
                                 #[cfg(feature = "a11y")]
-                                self.init_adapter(event_loop, id, window.clone());
+                                self.init_adapter(
+                                    event_loop,
+                                    id,
+                                    window.clone(),
+                                );
 
                                 self.process_event(
                                     event_loop,
@@ -572,11 +576,10 @@ where
                                     .expect("Send event");
                             }
                             Control::Winit(id, e) => {
-                                #[cfg(all(feature = "cctk", target_os = "linux"))]
+                                #[cfg(wayland_platform)]
                                 {
                                     if matches!(e, WindowEvent::RedrawRequested)
-                                    {                    
-                                        
+                                    {
                                         for id in crate::subsurface_widget::subsurface_ids(id) {
                                             _ = self.sender
                                                 .unbounded_send(Event::Winit(
@@ -597,7 +600,7 @@ where
                                         }
                                     }
                                 }
-                                
+
                                 self.sender
                                     .start_send(Event::Winit(id, e))
                                     .expect("Send event");
@@ -610,7 +613,7 @@ where
                             #[cfg(feature = "a11y")]
                             Control::InitAdapter(id, window) => {
                                 self.init_adapter(event_loop, id, window);
-                            
+
                                 self.process_event(
                                     event_loop,
                                     Some(Event::A11yAdapter(id)),
@@ -618,8 +621,8 @@ where
                             }
                             #[cfg(feature = "a11y")]
                             Control::Cleanup(id) => {
-                               _ = self.adapters.remove(&id);
-                            },
+                                _ = self.adapters.remove(&id);
+                            }
                         },
                         _ => {
                             break;
@@ -633,34 +636,35 @@ where
             }
         }
 
-    #[cfg(feature = "a11y")]
-    fn init_adapter(&mut self, event_loop: &(dyn winit::event_loop::ActiveEventLoop + 'static), id: core::window::Id, window: Arc<dyn winit::window::Window + 'static>) {
+        #[cfg(feature = "a11y")]
+        fn init_adapter(
+            &mut self,
+            event_loop: &(dyn winit::event_loop::ActiveEventLoop + 'static),
+            id: core::window::Id,
+            window: Arc<dyn winit::window::Window + 'static>,
+        ) {
             use crate::a11y::*;
             use iced_accessibility::accesskit::{
-                ActivationHandler, Node, NodeId, Role,
-                Tree, TreeUpdate,
+                ActivationHandler, Node, NodeId, Role, Tree, TreeUpdate,
             };
             use iced_accessibility::accesskit_winit::Adapter;
-        
-            let node_id =
-                iced_runtime::core::id::window_node_id();
-        
-            let activation_handler =
-                WinitActivationHandler {
-                    proxy: self.control_sender.clone(),
-                    title: String::new(),
-                };
-        
+
+            let node_id = iced_runtime::core::id::window_node_id();
+
+            let activation_handler = WinitActivationHandler {
+                proxy: self.control_sender.clone(),
+                title: String::new(),
+            };
+
             let action_handler = WinitActionHandler {
                 id,
                 proxy: self.control_sender.clone(),
             };
-        
-            let deactivation_handler =
-                WinitDeactivationHandler {
-                    proxy: self.control_sender.clone(),
-                };
-        
+
+            let deactivation_handler = WinitDeactivationHandler {
+                proxy: self.control_sender.clone(),
+            };
+
             _ = self.adapters.insert(
                 id,
                 (
@@ -674,8 +678,6 @@ where
                     ),
                 ),
             );
-        
-            
         }
     }
 
@@ -770,7 +772,7 @@ async fn run_instance<P>(
 
     let mut platform_specific_handler =
         crate::platform_specific::PlatformSpecific::default();
-    #[cfg(all(feature = "cctk", target_os = "linux"))]
+    #[cfg(wayland_platform)]
     if is_wayland {
         platform_specific_handler = platform_specific_handler.with_wayland(
             control_sender.clone(),
@@ -855,6 +857,8 @@ async fn run_instance<P>(
                 &mut is_window_opening,
                 &mut system_theme,
                 &mut platform_specific_handler,
+                &mut dnd_surface,
+                &mut dnd_surface_id,
                 is_daemon,
             )
         };
@@ -879,10 +883,9 @@ async fn run_instance<P>(
                 exit_on_close_request,
                 make_visible,
                 on_open,
-                resize_border
+                resize_border,
             } => {
-                
-                #[cfg(all(feature = "cctk", target_os = "linux"))]
+                #[cfg(wayland_platform)]
                 platform_specific_handler.send_wayland(
                     platform_specific::Action::TrackWindow(window.clone(), id),
                 );
@@ -937,7 +940,7 @@ async fn run_instance<P>(
                     compositor,
                     exit_on_close_request,
                     system_theme,
-                    resize_border
+                    resize_border,
                 );
 
                 window.raw.set_theme(conversion::window_theme(
@@ -1034,7 +1037,7 @@ async fn run_instance<P>(
                     continue;
                 };
 
-                let Some((id, mut window))  =
+                let Some((id, mut window)) =
                     window_manager.get_mut_alias(window_id)
                 else {
                     continue;
@@ -1049,12 +1052,12 @@ async fn run_instance<P>(
                         ))
                         .expect("Send redraw event");
                     continue;
-                } 
+                }
                 // XX must force update to corner radius before the surface is committed.
-                #[cfg(all(feature = "cctk", target_os = "linux"))]
+                #[cfg(wayland_platform)]
                 if (window.surface_version != window.state.surface_version()
-                    || window.logical_size() != window.state.logical_size()
-                    ) && !crate::subsurface_widget::is_subsurface(window_id)
+                    || window.logical_size() != window.state.logical_size())
+                    && !crate::subsurface_widget::is_subsurface(window_id)
                 {
                     platform_specific_handler.send_wayland(
                         platform_specific::Action::ResizeWindow(id),
@@ -1320,13 +1323,26 @@ async fn run_instance<P>(
                     continue;
                 };
                 // Initiates a drag resize window state when found.
-                if let Some(func) =
-                    window.drag_resize_window_func.as_mut()
-                {
-                    if func(window.raw.as_ref(), &event) {
+                if let Some(func) = window.drag_resize_window_func.as_mut() {
+                    if func(
+                        window.raw.as_ref(),
+                        &event,
+                        window.mouse_interaction,
+                    ) {
                         continue;
                     }
                 }
+                // to avoid race with the reported modifier state from the popup of
+                // this window, don't empty the modifiers, on focus loss
+                #[cfg(wayland_platform)]
+                if let winit::event::WindowEvent::ModifiersChanged(modifiers) =
+                    &event
+                    && modifiers.state().is_empty()
+                    && platform_specific_handler.has_popup(id)
+                {
+                    continue;
+                }
+
                 match event {
                     winit::event::WindowEvent::SurfaceResized(_) => {
                         window.raw.request_redraw();
@@ -1348,7 +1364,9 @@ async fn run_instance<P>(
                 if matches!(event, winit::event::WindowEvent::CloseRequested)
                     && window.exit_on_close_request
                 {
-                    _ = run_action!(Action::Window(runtime::window::Action::Close(id)));
+                    _ = run_action!(Action::Window(
+                        runtime::window::Action::Close(id)
+                    ));
                 } else {
                     window.state.update(&program, window.raw.as_ref(), &event);
 
@@ -1390,8 +1408,7 @@ async fn run_instance<P>(
                             true
                         }
                     });
-                    let no_window_events = window_events.is_empty();
-                    #[cfg(all(feature = "cctk", target_os = "linux"))]
+                    #[cfg(wayland_platform)]
                     window_events.push(core::Event::PlatformSpecific(
                         core::event::PlatformSpecific::Wayland(
                             core::event::wayland::Event::RequestResize,
@@ -1408,8 +1425,7 @@ async fn run_instance<P>(
                             &mut clipboard,
                             &mut messages,
                         );
-                    let mut needs_redraw =
-                        !no_window_events || !messages.is_empty();
+                    let mut needs_redraw = !messages.is_empty();
                     if let Some(requested_size) =
                         clipboard.requested_logical_size.lock().unwrap().take()
                     {
@@ -1465,7 +1481,16 @@ async fn run_instance<P>(
                             mouse_interaction,
                             ..
                         } => {
+                            let mouse_changed =
+                                window.mouse_interaction != mouse_interaction;
+
                             window.update_mouse(mouse_interaction);
+
+                            if mouse_changed {
+                                window.request_redraw(
+                                    core::window::RedrawRequest::NextFrame,
+                                );
+                            }
 
                             #[cfg(not(feature = "unconditional-rendering"))]
                             window.request_redraw(_redraw_request);
@@ -1736,7 +1761,6 @@ async fn run_instance<P>(
                                 };
 
                                 // search windows for widget with operation
-                                 
                                 if result.is_none() {
                                     log::warn!(
                                         "start_dnd: widget {:?} not found; drag will fail",
@@ -2070,6 +2094,10 @@ fn run_action<'a, P, C>(
     is_window_opening: &mut bool,
     system_theme: &mut theme::Mode,
     platform_specific: &mut crate::platform_specific::PlatformSpecific,
+    dnd_surface: &mut Option<
+        Arc<Box<dyn HasWindowHandle + Send + Sync + 'static>>,
+    >,
+    dnd_surface_id: &mut Option<window::Id>,
     is_daemon: bool,
 ) -> bool
 where
@@ -2113,7 +2141,7 @@ where
                         on_open: channel,
                     })
                     .expect("Send control action");
-                
+
                 *is_window_opening = true;
             }
             window::Action::Close(id) => {
@@ -2124,7 +2152,7 @@ where
                     _ = control_sender.start_send(Control::Cleanup(id)).ok();
                 }
                 let proxy = clipboard.proxy();
-                #[cfg(all(feature = "cctk", target_os = "linux"))]
+                #[cfg(wayland_platform)]
                 platform_specific
                     .send_wayland(platform_specific::Action::RemoveWindow(id));
                 if let Some(window) = window_manager.remove(id) {
@@ -2508,6 +2536,8 @@ where
             while let Some(mut operation) = current_operation.take() {
                 for (id, ui) in interfaces.iter_mut() {
                     if let Some(window) = window_manager.get_mut(*id) {
+                        operation.as_mut().set_window_id(*id);
+
                         ui.operate(&window.renderer, operation.as_mut());
                     }
                 }
@@ -2585,6 +2615,10 @@ where
             }
             iced_runtime::dnd::DndAction::EndDnd => {
                 clipboard.end_dnd();
+                *dnd_surface = None;
+                if let Some(id) = dnd_surface_id.take() {
+                    platform_specific.retain_subsurfaces(|other| other != id);
+                }
             }
             iced_runtime::dnd::DndAction::PeekDnd(m, channel) => {
                 let data = clipboard.peek_dnd(m);
@@ -2622,10 +2656,10 @@ where
             .and_then(|window| theme::Base::palette(window.state.theme()))
     });
 
-    cached_user_interfaces
-        .drain()
-        .filter_map(|(id, cache)| {
-            let window = window_manager.get_mut(id)?;
+    window_manager
+        .iter_mut()
+        .filter_map(|(id, window)| {
+            let cache = cached_user_interfaces.remove(&id)?;
 
             Some((
                 id,
@@ -2698,7 +2732,5 @@ fn system_information(
         graphics_backend: graphics.backend,
     }
 }
-#[cfg(feature = "program")]
-pub use program::Program;
 
 pub use platform_specific::*;

@@ -7,7 +7,7 @@ use cosmic::app::Settings;
 use cosmic::iced::{Alignment, Length, Size};
 use cosmic::prelude::*;
 use cosmic::widget::menu::{self, KeyBind};
-use cosmic::widget::nav_bar;
+use cosmic::widget::{nav_bar, RcElementWrapper};
 use cosmic::{executor, iced, widget, Core};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -43,12 +43,31 @@ pub enum Action {
 impl widget::menu::Action for Action {
     type Message = Message;
 
-    fn message(&self) -> Message {
+    fn message(&self) -> Self::Message {
         match self {
             Action::Hi => Message::Hi,
             Action::Hi2 => Message::Hi2,
             Action::Hi3 => Message::Hi3,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action2 {
+    Hi,
+    Hi2,
+    Hi3,
+}
+
+impl widget::menu::Action for Action2 {
+    type Message = cosmic::Action<Message>;
+
+    fn message(&self) -> Self::Message {
+        cosmic::Action::App(match self {
+            Action2::Hi => Message::Hi,
+            Action2::Hi2 => Message::Hi2,
+            Action2::Hi3 => Message::Hi3,
+        })
     }
 }
 
@@ -79,7 +98,7 @@ pub enum Message {
     Input2(String),
     Ignore,
     ToggleHide,
-    Surface(cosmic::surface::Action),
+    Surface(cosmic::surface::Action<Message>),
     Hi,
     Hi2,
     Hi3,
@@ -158,6 +177,70 @@ impl cosmic::Application for App {
         self.update_title()
     }
 
+    fn nav_context_menu(&self) -> Option<Vec<menu::Tree<cosmic::Action<Self::Message>>>> {
+        Some(menu::nav_context(
+            &HashMap::new(),
+            vec![
+                vec![cosmic::widget::menu::Item::Button(
+                    "Hi",
+                    Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                    Action2::Hi,
+                )],
+                vec![
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 2",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 22",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                ],
+                vec![
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 3",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 33",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 333",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                ],
+                vec![
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 44",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 4444",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 444444",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                    cosmic::widget::menu::Item::Button(
+                        "Hi 444444444444",
+                        Some(cosmic::widget::icon::from_name("screenshot-window-symbolic").into()),
+                        Action2::Hi,
+                    ),
+                ],
+            ],
+        ))
+    }
+
     /// Handle application events here.
     fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
         match message {
@@ -172,9 +255,7 @@ impl cosmic::Application for App {
                 self.hidden = !self.hidden;
             }
             Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(a),
-                ));
+                return cosmic::task::message(cosmic::Action::Surface(a));
             }
             Message::Hi => {
                 dbg!("hi");
@@ -282,6 +363,7 @@ impl cosmic::Application for App {
                         .progress(1.0)
                         .width(Length::Fill),
                 )
+                .push(widget::button::suggested("asdf").on_press(Message::Ignore))
                 .spacing(cosmic::theme::spacing().space_s)
                 .width(Length::Fill)
                 .height(Length::Shrink)

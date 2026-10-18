@@ -24,6 +24,7 @@ pub struct Viewer<'a, Handle, Message> {
     filter_method: FilterMethod,
     content_fit: ContentFit,
     on_zoom: Option<Box<dyn Fn(f32) -> Message + 'a>>,
+    page: Option<u64>,
 }
 
 impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
@@ -40,10 +41,21 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
             filter_method: FilterMethod::default(),
             content_fit: ContentFit::default(),
             on_zoom: None,
+            page: None,
         }
     }
 
     /// Sets a message to be produced whenever the [`Viewer`]'s zoom scale changes.
+    /// Identifies the image being shown, e.g. a page number. When it
+    /// changes, the zoom is kept but the view moves to the top of the new
+    /// image (keeping the horizontal position), as when turning the page of
+    /// a zoomed-in comic.
+    pub fn page(mut self, page: u64) -> Self {
+        self.page = Some(page);
+        self
+    }
+
+    /// Sets the message produced when the zoom changes.
     pub fn on_zoom(mut self, f: impl Fn(f32) -> Message + 'a) -> Self {
         self.on_zoom = Some(Box::new(f));
         self
@@ -128,7 +140,7 @@ where
 
     fn layout(
         &mut self,
-        _tree: &mut Tree,
+        tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
@@ -156,6 +168,18 @@ where
                 _ => raw_size.height,
             },
         };
+
+        // A new page: same zoom, but start at its top.
+        let state = tree.state.downcast_mut::<State>();
+        if self.page.is_some() && state.page != self.page {
+            if state.page.is_some() {
+                let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
+                let hidden_height = ((scaled.height - final_size.height) / 2.0).max(0.0).round();
+                state.current_offset.y = -hidden_height;
+                state.starting_offset = state.current_offset;
+            }
+            state.page = self.page;
+        }
 
         layout::Node::new(final_size)
     }
@@ -536,6 +560,7 @@ pub struct State {
     touch_a: Option<(touch::Finger, Point)>,
     touch_b: Option<(touch::Finger, Point)>,
     pinch_last_dist: Option<f32>,
+    page: Option<u64>,
 }
 
 impl Default for State {
@@ -549,6 +574,7 @@ impl Default for State {
             touch_a: None,
             touch_b: None,
             pinch_last_dist: None,
+            page: None,
         }
     }
 }

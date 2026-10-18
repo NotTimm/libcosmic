@@ -210,6 +210,10 @@ where
             // exactly like the two fingers). Panning is a no-op when the
             // image isn't larger than the viewport, since `offset()` clamps
             // it away at draw time.
+            //
+            // Holding Shift zooms in finer steps. Some systems turn
+            // Shift + wheel into a horizontal scroll, so then the x delta
+            // counts as the zoom direction.
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let state = tree.state.downcast_mut::<State>();
                 let is_physical_wheel = matches!(delta, mouse::ScrollDelta::Lines { .. });
@@ -256,20 +260,28 @@ where
                     return;
                 };
 
+                let fine = state.modifiers.shift();
                 let y = match *delta {
-                    mouse::ScrollDelta::Lines { y, .. }
-                    | mouse::ScrollDelta::Pixels { y, .. } => y,
+                    mouse::ScrollDelta::Lines { x, y }
+                    | mouse::ScrollDelta::Pixels { x, y } => {
+                        if fine && y == 0.0 { x } else { y }
+                    }
                 };
 
                 if y == 0.0 {
                     return;
                 }
 
+                let step = if fine {
+                    self.scale_step / 4.0
+                } else {
+                    self.scale_step
+                };
                 let previous_scale = state.scale;
                 let new_scale = (if y > 0.0 {
-                    state.scale * (1.0 + self.scale_step)
+                    state.scale * (1.0 + step)
                 } else {
-                    state.scale / (1.0 + self.scale_step)
+                    state.scale / (1.0 + step)
                 })
                 .clamp(self.min_scale, self.max_scale);
 

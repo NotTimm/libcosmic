@@ -195,7 +195,9 @@ impl<'a, Message: Clone + 'static> Widget<Message, crate::Theme, crate::Renderer
         let start_width = start_node.size().width;
 
         let vcenter = |node: layout::Node, x: f32| -> layout::Node {
-            let dy = ((height - node.size().height) / 2.0).max(0.0);
+            // Rounded so items sit on whole pixels; a half-pixel offset
+            // blurs small icons.
+            let dy = ((height - node.size().height) / 2.0).max(0.0).round();
             node.translate(Vector::new(x, dy))
         };
 

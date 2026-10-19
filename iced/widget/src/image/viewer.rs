@@ -25,6 +25,7 @@ pub struct Viewer<'a, Handle, Message> {
     content_fit: ContentFit,
     on_zoom: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     page: Option<u64>,
+    whole: bool,
 }
 
 impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
@@ -42,6 +43,7 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
             content_fit: ContentFit::default(),
             on_zoom: None,
             page: None,
+            whole: false,
         }
     }
 
@@ -52,6 +54,14 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
     /// a zoomed-in comic.
     pub fn page(mut self, page: u64) -> Self {
         self.page = Some(page);
+        self
+    }
+
+    /// Shows this page whole when it's turned to (zoomed out to fit), as
+    /// for a two-page spread. The zoom from before comes back on the next
+    /// page that isn't, unless the user zooms in on this one meanwhile.
+    pub fn whole_page(mut self, whole: bool) -> Self {
+        self.whole = whole;
         self
     }
 
@@ -169,16 +179,32 @@ where
             },
         };
 
-        // A new page: same zoom, but start at its top.
+        // A new page: same zoom, but start at its top. A page shown whole
+        // (a spread) is zoomed out to fit, and the zoom from before comes
+        // back after it.
         let state = tree.state.downcast_mut::<State>();
         if self.page.is_some() && state.page != self.page {
             if state.page.is_some() {
-                let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
-                let hidden_height = ((scaled.height - final_size.height) / 2.0).max(0.0).round();
-                state.current_offset.y = -hidden_height;
+                if self.whole {
+                    if state.scale != 1.0 && state.saved_scale.is_none() {
+                        state.saved_scale = Some(state.scale);
+                    }
+                    state.scale = 1.0;
+                    state.current_offset = Vector::default();
+                } else {
+                    if let Some(scale) = state.saved_scale.take() {
+                        state.scale = scale;
+                    }
+                    let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
+                    let hidden_height = ((scaled.height - final_size.height) / 2.0).max(0.0).round();
+                    state.current_offset.y = -hidden_height;
+                }
                 state.starting_offset = state.current_offset;
             }
             state.page = self.page;
+        } else if self.whole && state.scale != 1.0 {
+            // Zoomed in on the spread: that zoom carries on from here.
+            state.saved_scale = None;
         }
 
         layout::Node::new(final_size)
@@ -573,6 +599,8 @@ pub struct State {
     touch_b: Option<(touch::Finger, Point)>,
     pinch_last_dist: Option<f32>,
     page: Option<u64>,
+    /// The zoom to return to after a page shown whole.
+    saved_scale: Option<f32>,
 }
 
 impl Default for State {
@@ -587,6 +615,7 @@ impl Default for State {
             touch_b: None,
             pinch_last_dist: None,
             page: None,
+            saved_scale: None,
         }
     }
 }

@@ -76,6 +76,8 @@ pub(crate) fn iced_settings<App: Application>(
         window_settings.resizable = true;
     }
     window_settings.decorations = !settings.client_decorations;
+    core.window.system_decorations = !settings.client_decorations;
+    core.window.sharp_corners |= core.window.system_decorations;
     window_settings.size = settings.size;
     let min_size = settings.size_limits.min();
     if min_size != iced::Size::ZERO {
@@ -616,6 +618,8 @@ impl<App: Application> ApplicationExt for App {
         let is_condensed = core.is_condensed();
         let sharp_corners = core.window.sharp_corners;
         let maximized = core.window.is_maximized;
+        // No outline of our own inside a frame the system draws.
+        let outlined = !maximized && !core.window.system_decorations;
         let content_container = core.window.content_container;
         let show_context = core.window.show_context;
         let nav_bar_active = core.nav_bar_active();
@@ -854,7 +858,7 @@ impl<App: Application> ApplicationExt for App {
             // The content element contains every element beneath the header.
             .push(content)
             .apply(container)
-            .padding(if maximized { 0 } else { 1 })
+            .padding(if outlined { 1 } else { 0 })
             .class(crate::theme::Container::custom(move |theme| {
                 container::Style {
                     background: if content_container {
@@ -866,7 +870,7 @@ impl<App: Application> ApplicationExt for App {
                     },
                     border: iced::Border {
                         color: theme.cosmic().bg_divider().into(),
-                        width: if maximized { 0.0 } else { 1.0 },
+                        width: if outlined { 1.0 } else { 0.0 },
                         radius: window_corner_radius.into(),
                     },
                     ..Default::default()

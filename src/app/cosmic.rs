@@ -794,7 +794,8 @@ impl<T: Application> Cosmic<T> {
                     .main_window_id()
                     .is_some_and(|main_id| main_id == id)
                 {
-                    self.app.core_mut().window.sharp_corners = maximized;
+                    let window = &mut self.app.core_mut().window;
+                    window.sharp_corners = maximized || window.system_decorations;
                 }
             }
 
@@ -825,15 +826,20 @@ impl<T: Application> Cosmic<T> {
                     .main_window_id()
                     .is_some_and(|main_id| main_id == id)
                 {
-                    self.app.core_mut().window.sharp_corners = state.intersects(
-                        WindowState::MAXIMIZED
-                            | WindowState::FULLSCREEN
-                            | WindowState::TILED
-                            | WindowState::TILED_RIGHT
-                            | WindowState::TILED_LEFT
-                            | WindowState::TILED_TOP
-                            | WindowState::TILED_BOTTOM,
-                    );
+                    self.app.core_mut().window.sharp_corners = self
+                        .app
+                        .core()
+                        .window
+                        .system_decorations
+                        || state.intersects(
+                            WindowState::MAXIMIZED
+                                | WindowState::FULLSCREEN
+                                | WindowState::TILED
+                                | WindowState::TILED_RIGHT
+                                | WindowState::TILED_LEFT
+                                | WindowState::TILED_TOP
+                                | WindowState::TILED_BOTTOM,
+                        );
                     self.app.core_mut().window.is_maximized =
                         state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN);
                 }

@@ -40,6 +40,10 @@ pub struct Window {
     pub show_maximize: bool,
     pub show_minimize: bool,
     pub is_maximized: bool,
+    /// The system draws the window frame (`client_decorations(false)`), so
+    /// the content keeps square corners: rounding them would show inside
+    /// the system's frame.
+    pub(crate) system_decorations: bool,
     pub border_padding: Option<u16>,
     height: f32,
     width: f32,
@@ -170,6 +174,7 @@ impl Default for Core {
                 show_minimize: true,
                 show_window_menu: false,
                 is_maximized: false,
+                system_decorations: false,
                 height: 0.,
                 width: 0.,
                 border_padding: None,

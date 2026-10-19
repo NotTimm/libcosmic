@@ -13,6 +13,7 @@ pub(super) struct Overlay<'a, 'b, Message> {
     pub(crate) position: Point,
     pub(super) content: &'b mut Element<'a, Message>,
     pub(super) tree: &'b mut widget::Tree,
+    pub(super) on_close: Option<Message>,
     pub(super) width: f32,
 }
 
@@ -65,6 +66,23 @@ where
             shell,
             &layout.bounds(),
         );
+        // The overlay spans the whole content with the drawer aligned to
+        // the end; a press on the uncovered part closes the drawer.
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Touch(touch::Event::FingerPressed { .. })
+        ) && !shell.is_event_captured()
+            && cursor.is_over(layout.bounds())
+            && layout
+                .children()
+                .next()
+                .is_some_and(|drawer| !cursor.is_over(drawer.bounds()))
+        {
+            if let Some(on_close) = &self.on_close {
+                shell.publish(on_close.clone());
+            }
+        }
         match event {
             Event::Mouse(e) if !matches!(e, mouse::Event::CursorLeft) => {
                 if cursor.is_over(layout.bounds()) {

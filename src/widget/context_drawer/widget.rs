@@ -165,14 +165,21 @@ impl<'a, Message: Clone + 'static> ContextDrawer<'a, Message> {
         Drawer: Into<Element<'a, Message>>,
     {
         let drawer = Self::new_inner_overlay(
-            title, actions, header, footer, drawer, on_close, max_width, true,
+            title,
+            actions,
+            header,
+            footer,
+            drawer,
+            on_close.clone(),
+            max_width,
+            true,
         );
 
         ContextDrawer {
             id: None,
             content: content.into(),
             drawer,
-            on_close: None,
+            on_close: Some(on_close),
         }
     }
 
@@ -319,6 +326,7 @@ impl<Message: Clone> Widget<Message, crate::Theme, Renderer> for ContextDrawer<'
         Some(iced_overlay::Element::new(Box::new(Overlay {
             content: &mut self.drawer,
             tree: &mut tree.children[1],
+            on_close: self.on_close.clone(),
             width: bounds.width,
             position,
         })))

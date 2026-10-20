@@ -5,6 +5,7 @@ use crate::core::keyboard;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::renderer;
+use crate::core::time::{Duration, Instant};
 use crate::core::touch;
 use crate::core::widget::tree::{self, Tree};
 use crate::core::{
@@ -242,11 +243,16 @@ where
             // counts as the zoom direction.
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let state = tree.state.downcast_mut::<State>();
-                let is_physical_wheel = matches!(delta, mouse::ScrollDelta::Lines { .. });
+                let is_physical_wheel =
+                    state.wheel.is_physical_wheel(delta, Instant::now());
 
                 if !is_physical_wheel && !state.modifiers.control() {
-                    let mouse::ScrollDelta::Pixels { x, y } = *delta else {
-                        return;
+                    let (x, y) = match *delta {
+                        mouse::ScrollDelta::Pixels { x, y } => (x, y),
+                        // A Windows touchpad (see `WheelSource`).
+                        mouse::ScrollDelta::Lines { x, y } => {
+                            (x * PIXELS_PER_LINE, y * PIXELS_PER_LINE)
+                        }
                     };
 
                     if x == 0.0 && y == 0.0 {
@@ -601,6 +607,7 @@ pub struct State {
     page: Option<u64>,
     /// The zoom to return to after a page shown whole.
     saved_scale: Option<f32>,
+    wheel: WheelSource,
 }
 
 impl Default for State {
@@ -616,7 +623,104 @@ impl Default for State {
             pinch_last_dist: None,
             page: None,
             saved_scale: None,
+            wheel: WheelSource::default(),
         }
+    }
+}
+
+/// How far a Windows touchpad pans per "line" it reports.
+const PIXELS_PER_LINE: f32 = 40.0;
+
+/// Tells a mouse wheel from a touchpad's two-finger scroll.
+///
+/// Linux (Wayland) and macOS report touchpads in `Pixels` and wheels in
+/// `Lines`. Windows reports both as `Lines`: a wheel notch is a whole
+/// number of lines (1, or the "lines per notch" setting), while a precision
+/// touchpad sends fractions of one. So on Windows fractional lines count
+/// as a touchpad, and so does everything else for a moment after them, as
+/// a touchpad can land on a whole number mid-gesture.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WheelSource {
+    touchpad_until: Option<Instant>,
+}
+
+impl WheelSource {
+    /// How long after fractional lines a scroll still counts as a touchpad.
+    const LINGER: Duration = Duration::from_millis(500);
+
+    /// Whether `delta` came from a physical mouse wheel.
+    pub fn is_physical_wheel(
+        &mut self,
+        delta: &mouse::ScrollDelta,
+        now: Instant,
+    ) -> bool {
+        self.classify(delta, now, cfg!(windows))
+    }
+
+    fn classify(
+        &mut self,
+        delta: &mouse::ScrollDelta,
+        now: Instant,
+        windows: bool,
+    ) -> bool {
+        let mouse::ScrollDelta::Lines { x, y } = *delta else {
+            return false;
+        };
+        if !windows {
+            return true;
+        }
+        let fractional = |v: f32| (v - v.round()).abs() > 1e-3;
+        if fractional(x) || fractional(y) {
+            self.touchpad_until = Some(now + Self::LINGER);
+            return false;
+        }
+        !self.touchpad_until.is_some_and(|until| now < until)
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    fn lines(y: f32) -> mouse::ScrollDelta {
+        mouse::ScrollDelta::Lines { x: 0.0, y }
+    }
+
+    #[test]
+    fn linux_and_mac_keep_lines_as_wheel_and_pixels_as_touchpad() {
+        let mut w = WheelSource::default();
+        let now = Instant::now();
+        assert!(w.classify(&lines(1.0), now, false));
+        assert!(w.classify(&lines(0.25), now, false));
+        assert!(!w.classify(
+            &mouse::ScrollDelta::Pixels { x: 0.0, y: 3.0 },
+            now,
+            false
+        ));
+    }
+
+    #[test]
+    fn windows_wheel_notches_are_whole_lines() {
+        let mut w = WheelSource::default();
+        let now = Instant::now();
+        assert!(w.classify(&lines(1.0), now, true));
+        assert!(w.classify(&lines(-3.0), now, true));
+    }
+
+    #[test]
+    fn windows_touchpad_sends_fractions_and_lingers() {
+        let mut w = WheelSource::default();
+        let t0 = Instant::now();
+        assert!(!w.classify(&lines(0.075), t0, true));
+        assert!(!w.classify(
+            &mouse::ScrollDelta::Lines { x: -0.3, y: 0.0 },
+            t0,
+            true
+        ));
+        // A whole number mid-gesture is still the touchpad...
+        assert!(!w.classify(&lines(1.0), t0 + Duration::from_millis(100), true));
+        // ...but a wheel notch well after the gesture zooms again.
+        assert!(w.classify(&lines(1.0), t0 + Duration::from_millis(900), true));
     }
 }
 

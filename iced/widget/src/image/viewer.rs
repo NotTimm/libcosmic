@@ -8,6 +8,7 @@ use crate::core::renderer;
 use crate::core::time::{Duration, Instant};
 use crate::core::touch;
 use crate::core::widget::tree::{self, Tree};
+use crate::core::window;
 use crate::core::{
     Clipboard, ContentFit, Element, Event, Image, Layout, Length, Pixels,
     Point, Radians, Rectangle, Shell, Size, Vector, Widget,
@@ -185,6 +186,8 @@ where
         // back after it.
         let state = tree.state.downcast_mut::<State>();
         if self.page.is_some() && state.page != self.page {
+            // A flick on the last page doesn't carry over to this one.
+            state.fling = None;
             if state.page.is_some() {
                 if self.whole {
                     if state.scale != 1.0 && state.saved_scale.is_none() {
@@ -243,6 +246,7 @@ where
             // counts as the zoom direction.
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let state = tree.state.downcast_mut::<State>();
+                state.fling = None;
                 let is_physical_wheel =
                     state.wheel.is_physical_wheel(delta, Instant::now());
 
@@ -259,28 +263,13 @@ where
                         return;
                     }
 
-                    let scaled_size = scaled_image_size(
+                    let _ = pan_by(
+                        state,
+                        Vector::new(x, y),
+                        bounds,
                         renderer,
                         &self.handle,
-                        state,
-                        bounds.size(),
                         self.content_fit,
-                    );
-                    let hidden_width = ((scaled_size.width - bounds.width) / 2.0)
-                        .max(0.0)
-                        .round();
-                    let hidden_height = ((scaled_size.height - bounds.height) / 2.0)
-                        .max(0.0)
-                        .round();
-
-                    let unclamped = state.current_offset - Vector::new(x, y);
-                    // Clamp immediately (not just at draw time) so reversing
-                    // direction after hitting an edge moves the page right
-                    // away instead of first having to "unwind" however far
-                    // past the edge the scroll would otherwise have gone.
-                    state.current_offset = Vector::new(
-                        unclamped.x.clamp(-hidden_width, hidden_width),
-                        unclamped.y.clamp(-hidden_height, hidden_height),
                     );
 
                     shell.request_redraw();
@@ -370,35 +359,69 @@ where
                 shell.request_redraw();
                 shell.capture_event();
             }
-            // Touchscreen two-finger pinch (distinct from the trackpad
-            // gesture above, which arrives as WheelZoomed instead).
+            // Touchscreen: one finger drags a zoomed page around, freely on
+            // both axes and 1:1 with the finger, and a flick carries on
+            // with momentum. Two fingers pinch to zoom around the point
+            // between them and move the page along as they slide (distinct
+            // from the trackpad pinch above, which arrives as WheelZoomed).
             Event::Touch(touch_event) => {
                 let state = tree.state.downcast_mut::<State>();
+                let now = Instant::now();
 
-                let id = match *touch_event {
-                    touch::Event::FingerPressed { id, .. }
-                    | touch::Event::FingerMoved { id, .. }
-                    | touch::Event::FingerLifted { id, .. }
-                    | touch::Event::FingerLost { id, .. } => id,
+                let (id, position) = match *touch_event {
+                    touch::Event::FingerPressed { id, position }
+                    | touch::Event::FingerMoved { id, position }
+                    | touch::Event::FingerLifted { id, position }
+                    | touch::Event::FingerLost { id, position } => {
+                        (id, position)
+                    }
                 };
                 let is_a = state.touch_a.is_some_and(|(i, _)| i == id);
                 let is_b = state.touch_b.is_some_and(|(i, _)| i == id);
+                state.last_touch = Some(now);
 
                 match *touch_event {
-                    touch::Event::FingerPressed { position, .. } => {
+                    touch::Event::FingerPressed { .. } => {
+                        if !bounds.contains(position) {
+                            return;
+                        }
+                        // A finger on the page stops a flick and takes over
+                        // from a mouse drag Windows may have made of it.
+                        state.fling = None;
+                        state.cursor_grabbed_at = None;
                         if state.touch_a.is_none() {
                             state.touch_a = Some((id, position));
                         } else if state.touch_b.is_none() {
                             state.touch_b = Some((id, position));
                         }
-                        state.pinch_last_dist = None;
+                        state.reset_touch_gesture();
                     }
-                    touch::Event::FingerMoved { position, .. } if is_a || is_b => {
-                        if is_a {
-                            state.touch_a = Some((id, position));
-                        } else {
-                            state.touch_b = Some((id, position));
+                    touch::Event::FingerMoved { .. } if !is_a && !is_b => {
+                        // A finger that went down before the viewer was
+                        // shown (zoom starts on the second finger of a
+                        // pinch): pick it up so the pinch works right away.
+                        if !bounds.contains(position) {
+                            return;
                         }
+                        if state.touch_a.is_none() {
+                            state.touch_a = Some((id, position));
+                        } else if state.touch_b.is_none() {
+                            state.touch_b = Some((id, position));
+                        } else {
+                            return;
+                        }
+                        state.fling = None;
+                        state.reset_touch_gesture();
+                        shell.capture_event();
+                    }
+                    touch::Event::FingerMoved { .. } => {
+                        let slot = if is_a {
+                            &mut state.touch_a
+                        } else {
+                            &mut state.touch_b
+                        };
+                        let previous = slot.map(|(_, p)| p).unwrap_or(position);
+                        *slot = Some((id, position));
 
                         if let (Some((_, a)), Some((_, b))) =
                             (state.touch_a, state.touch_b)
@@ -430,25 +453,98 @@ where
                                         if let Some(on_zoom) = &self.on_zoom {
                                             shell.publish(on_zoom(state.scale));
                                         }
-                                        shell.request_redraw();
                                     }
                                 }
                             }
+                            if let Some(last) = state.pinch_last_mid {
+                                let _ = pan_by(
+                                    state,
+                                    midpoint - last,
+                                    bounds,
+                                    renderer,
+                                    &self.handle,
+                                    self.content_fit,
+                                );
+                            }
                             state.pinch_last_dist = Some(dist);
-                            shell.capture_event();
+                            state.pinch_last_mid = Some(midpoint);
+                        } else {
+                            // One finger: the page follows it.
+                            let moved = position - previous;
+                            let _ = pan_by(
+                                state,
+                                moved,
+                                bounds,
+                                renderer,
+                                &self.handle,
+                                self.content_fit,
+                            );
+                            state.velocity.track(moved, now);
                         }
+                        shell.request_redraw();
+                        shell.capture_event();
                     }
                     touch::Event::FingerLifted { .. }
                     | touch::Event::FingerLost { .. } => {
+                        if !is_a && !is_b {
+                            return;
+                        }
+                        let alone = state.touch_a.is_none()
+                            || state.touch_b.is_none();
+                        if alone
+                            && matches!(
+                                touch_event,
+                                touch::Event::FingerLifted { .. }
+                            )
+                        {
+                            if let Some(velocity) = state.velocity.release(now)
+                            {
+                                state.fling = Some(Fling {
+                                    velocity,
+                                    last: now,
+                                });
+                                shell.request_redraw();
+                            }
+                        }
                         if is_a {
                             state.touch_a = None;
                         }
                         if is_b {
                             state.touch_b = None;
                         }
-                        state.pinch_last_dist = None;
+                        // The finger left on the page carries on from where
+                        // it is, without a jump.
+                        state.reset_touch_gesture();
                     }
-                    _ => {}
+                }
+            }
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                let state = tree.state.downcast_mut::<State>();
+                let Some(fling) = state.fling.as_mut() else {
+                    return;
+                };
+                let step = fling.step(*now);
+                let blocked = pan_by(
+                    state,
+                    step,
+                    bounds,
+                    renderer,
+                    &self.handle,
+                    self.content_fit,
+                );
+                if let Some(fling) = state.fling.as_mut() {
+                    // Hitting an edge stops that direction only.
+                    if blocked.0 {
+                        fling.velocity.x = 0.0;
+                    }
+                    if blocked.1 {
+                        fling.velocity.y = 0.0;
+                    }
+                    if fling.is_done() {
+                        state.fling = None;
+                    } else {
+                        shell.request_redraw();
+                    }
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -458,6 +554,13 @@ where
 
                 let state = tree.state.downcast_mut::<State>();
 
+                // Windows can also send a finger as a mouse; the touch
+                // handling above moves the page already.
+                if state.touch_in_use(Instant::now()) {
+                    return;
+                }
+
+                state.fling = None;
                 state.cursor_grabbed_at = Some(cursor_position);
                 state.starting_offset = state.current_offset;
 
@@ -604,6 +707,12 @@ pub struct State {
     touch_a: Option<(touch::Finger, Point)>,
     touch_b: Option<(touch::Finger, Point)>,
     pinch_last_dist: Option<f32>,
+    /// Where the two fingers' midpoint was, to move the page with them.
+    pinch_last_mid: Option<Point>,
+    /// The last touch event, to ignore the mouse Windows makes of a finger.
+    last_touch: Option<Instant>,
+    velocity: TouchVelocity,
+    fling: Option<Fling>,
     page: Option<u64>,
     /// The zoom to return to after a page shown whole.
     saved_scale: Option<f32>,
@@ -621,10 +730,91 @@ impl Default for State {
             touch_a: None,
             touch_b: None,
             pinch_last_dist: None,
+            pinch_last_mid: None,
+            last_touch: None,
+            velocity: TouchVelocity::default(),
+            fling: None,
             page: None,
             saved_scale: None,
             wheel: WheelSource::default(),
         }
+    }
+}
+
+/// Follows a one-finger drag's speed, for the flick when it's let go.
+#[derive(Debug, Clone, Copy, Default)]
+struct TouchVelocity {
+    /// Pixels per second the page is moving (smoothed).
+    velocity: Vector,
+    last: Option<Instant>,
+}
+
+impl TouchVelocity {
+    /// Below this a lift just stops the page, as after a slow drag.
+    const MIN_FLICK: f32 = 150.0;
+    /// So one jumpy event can't send the page flying.
+    const MAX_FLICK: f32 = 8000.0;
+    /// A finger held still this long before lifting means "stop here".
+    const HELD: Duration = Duration::from_millis(80);
+
+    fn track(&mut self, moved: Vector, now: Instant) {
+        if let Some(last) = self.last {
+            let dt = now.saturating_duration_since(last).as_secs_f32();
+            if dt > Self::HELD.as_secs_f32() {
+                // Paused mid-drag: start over from here.
+                self.velocity = Vector::default();
+            } else if dt > 0.0 {
+                // Lean on the newest movement, smoothed a little against
+                // uneven event timing.
+                self.velocity = self.velocity * 0.3 + moved * (0.7 / dt);
+            }
+        }
+        self.last = Some(now);
+    }
+
+    /// The flick to carry on with when the finger lifts, if any.
+    fn release(&mut self, now: Instant) -> Option<Vector> {
+        let held = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) > Self::HELD);
+        let v = std::mem::take(self).velocity;
+        let speed = (v.x * v.x + v.y * v.y).sqrt();
+        if held || speed < Self::MIN_FLICK {
+            return None;
+        }
+        Some(v * (speed.min(Self::MAX_FLICK) / speed))
+    }
+}
+
+/// A flicked page gliding to a stop.
+#[derive(Debug, Clone, Copy)]
+struct Fling {
+    /// Pixels per second, in the direction the page moves.
+    velocity: Vector,
+    last: Instant,
+}
+
+impl Fling {
+    /// How quickly the glide slows: the speed falls to about a third every
+    /// this many seconds, and a flick travels its speed times this in all.
+    const SLOWDOWN: f32 = 0.35;
+    const STOP: f32 = 20.0;
+
+    /// How far the page moves this frame.
+    fn step(&mut self, now: Instant) -> Vector {
+        let dt = now
+            .saturating_duration_since(self.last)
+            .as_secs_f32()
+            // A frame that came late (window hidden) doesn't jump.
+            .min(0.05);
+        self.last = now;
+        let moved = self.velocity * dt;
+        self.velocity = self.velocity * (-dt / Self::SLOWDOWN).exp();
+        moved
+    }
+
+    fn is_done(&self) -> bool {
+        self.velocity.x.abs() < Self::STOP && self.velocity.y.abs() < Self::STOP
     }
 }
 
@@ -724,6 +914,34 @@ mod wheel_tests {
     }
 }
 
+/// Moves the page on screen by `moved` (as a finger dragging it, or a
+/// scroll), clamped right away so it can't be pushed past its edges and
+/// moves back at once on reversing. Returns whether x and y hit an edge.
+fn pan_by<Renderer, Handle>(
+    state: &mut State,
+    moved: Vector,
+    bounds: Rectangle,
+    renderer: &Renderer,
+    handle: &Handle,
+    content_fit: ContentFit,
+) -> (bool, bool)
+where
+    Renderer: image::Renderer<Handle = Handle>,
+{
+    let scaled_size =
+        scaled_image_size(renderer, handle, state, bounds.size(), content_fit);
+    let hidden_width =
+        ((scaled_size.width - bounds.width) / 2.0).max(0.0).round();
+    let hidden_height =
+        ((scaled_size.height - bounds.height) / 2.0).max(0.0).round();
+
+    let unclamped = state.current_offset - moved;
+    let x = unclamped.x.clamp(-hidden_width, hidden_width);
+    let y = unclamped.y.clamp(-hidden_height, hidden_height);
+    state.current_offset = Vector::new(x, y);
+    (x != unclamped.x, y != unclamped.y)
+}
+
 /// Rescales `state` to `new_scale`, adjusting `current_offset` so the point
 /// under `cursor_position` stays fixed on screen (zoom-to-cursor).
 fn apply_zoom<Renderer, Handle>(
@@ -788,6 +1006,29 @@ impl State {
         )
     }
 
+    /// Starts a touch gesture over from the fingers now down: a pinch
+    /// measures from where the two fingers are.
+    fn reset_touch_gesture(&mut self) {
+        (self.pinch_last_dist, self.pinch_last_mid) =
+            match (self.touch_a, self.touch_b) {
+                (Some((_, a)), Some((_, b))) => (
+                    Some(((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()),
+                    Some(Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)),
+                ),
+                _ => (None, None),
+            };
+        self.velocity = TouchVelocity::default();
+    }
+
+    /// Whether a finger is down or just lifted.
+    fn touch_in_use(&self, now: Instant) -> bool {
+        self.touch_a.is_some()
+            || self.touch_b.is_some()
+            || self.last_touch.is_some_and(|t| {
+                now.saturating_duration_since(t) < Duration::from_millis(500)
+            })
+    }
+
     /// Returns if the cursor is currently grabbed by the [`Viewer`].
     pub fn is_cursor_grabbed(&self) -> bool {
         self.cursor_grabbed_at.is_some()
@@ -830,4 +1071,224 @@ where
         adjusted_fit.width * state.scale,
         adjusted_fit.height * state.scale,
     )
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::*;
+    use crate::core::clipboard;
+
+    /// A 100×100 viewer on the null renderer (whose images measure
+    /// 100×100), zoomed to 2×: 50 px of page hidden on every side.
+    struct Harness {
+        viewer: Viewer<'static, image::Handle, ()>,
+        tree: Tree,
+        node: layout::Node,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut state = State::default();
+            state.scale = 2.0;
+            Harness {
+                viewer: Viewer::new(image::Handle::from_rgba(1, 1, vec![0; 4]))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                tree: Tree {
+                    tag: tree::Tag::of::<State>(),
+                    id: None,
+                    state: tree::State::new(state),
+                    children: Vec::new(),
+                },
+                node: layout::Node::new(Size::new(100.0, 100.0)),
+            }
+        }
+
+        /// Sends an event; returns whether it was captured.
+        fn send(&mut self, event: Event) -> bool {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            Widget::<(), (), ()>::update(
+                &mut self.viewer,
+                &mut self.tree,
+                &event,
+                Layout::new(&self.node),
+                mouse::Cursor::Unavailable,
+                &(),
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+            );
+            shell.is_event_captured()
+        }
+
+        fn finger(&mut self, f: fn(touch::Finger, Point) -> touch::Event, id: u64, x: f32, y: f32) -> bool {
+            self.send(Event::Touch(f(touch::Finger(id), Point::new(x, y))))
+        }
+
+        fn state(&mut self) -> &mut State {
+            self.tree.state.downcast_mut::<State>()
+        }
+
+        fn offset(&mut self) -> Vector {
+            self.state().current_offset
+        }
+    }
+
+    fn pressed(id: touch::Finger, position: Point) -> touch::Event {
+        touch::Event::FingerPressed { id, position }
+    }
+    fn moved(id: touch::Finger, position: Point) -> touch::Event {
+        touch::Event::FingerMoved { id, position }
+    }
+    fn lifted(id: touch::Finger, position: Point) -> touch::Event {
+        touch::Event::FingerLifted { id, position }
+    }
+
+    #[test]
+    fn one_finger_drags_both_axes_with_the_finger() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 50.0, 50.0);
+        // Diagonal: the page follows the finger on both axes at once.
+        assert!(h.finger(moved, 1, 40.0, 30.0));
+        // Same direction as dragging with the mouse.
+        assert_eq!(h.offset(), Vector::new(10.0, 20.0));
+        let _ = h.finger(moved, 1, 45.0, 35.0);
+        assert_eq!(h.offset(), Vector::new(5.0, 15.0));
+    }
+
+    #[test]
+    fn drag_stops_at_the_edge_and_comes_back_at_once() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 90.0, 50.0);
+        let _ = h.finger(moved, 1, 10.0, 50.0);
+        assert_eq!(h.offset(), Vector::new(50.0, 0.0));
+        // Reversing moves right away, with no slack to unwind.
+        let _ = h.finger(moved, 1, 15.0, 50.0);
+        assert_eq!(h.offset(), Vector::new(45.0, 0.0));
+    }
+
+    #[test]
+    fn a_page_that_fits_does_not_move() {
+        let mut h = Harness::new();
+        h.state().scale = 1.0;
+        let _ = h.finger(pressed, 1, 50.0, 50.0);
+        let _ = h.finger(moved, 1, 20.0, 20.0);
+        assert_eq!(h.offset(), Vector::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn a_press_outside_the_page_is_ignored() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 50.0, 150.0);
+        assert!(!h.finger(moved, 1, 40.0, 140.0));
+        assert_eq!(h.offset(), Vector::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn two_fingers_move_the_page_with_them() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 30.0, 50.0);
+        let _ = h.finger(pressed, 2, 70.0, 50.0);
+        // Both slide up by 10 without spreading: no zoom, page moves up.
+        let _ = h.finger(moved, 1, 30.0, 40.0);
+        let _ = h.finger(moved, 2, 70.0, 40.0);
+        // (One finger at a time, so the spread wobbles and settles back.)
+        assert!((h.state().scale - 2.0).abs() < 1e-4);
+        assert!((h.offset().y - 10.0).abs() < 0.5, "{:?}", h.offset());
+    }
+
+    #[test]
+    fn pinch_zooms_and_lifting_one_finger_carries_on_without_a_jump() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 40.0, 50.0);
+        let _ = h.finger(pressed, 2, 60.0, 50.0);
+        let _ = h.finger(moved, 1, 40.0, 50.0);
+        let _ = h.finger(moved, 2, 80.0, 50.0);
+        assert!(h.state().scale > 2.0);
+        let _ = h.finger(lifted, 2, 80.0, 50.0);
+        let before = h.offset();
+        let _ = h.finger(moved, 1, 35.0, 50.0);
+        assert_eq!(h.offset(), before + Vector::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn fingers_down_before_the_viewer_appeared_still_pinch() {
+        let mut h = Harness::new();
+        // No presses seen: zoom mode began on the second finger.
+        let _ = h.finger(moved, 1, 40.0, 50.0);
+        let _ = h.finger(moved, 2, 60.0, 50.0);
+        let _ = h.finger(moved, 2, 80.0, 50.0);
+        assert!(h.state().scale > 2.0);
+    }
+
+    #[test]
+    fn a_mouse_press_from_a_finger_does_not_drag_too() {
+        let mut h = Harness::new();
+        let _ = h.finger(pressed, 1, 50.0, 50.0);
+        let _ = h.send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)));
+        assert!(!h.state().is_cursor_grabbed());
+    }
+
+    #[test]
+    fn a_flick_glides_on_and_stops() {
+        let mut h = Harness::new();
+        h.state().scale = 10.0; // plenty of room to glide
+        let t0 = Instant::now();
+        h.state().fling = Some(Fling { velocity: Vector::new(-1000.0, 0.0), last: t0 });
+        let mut t = t0;
+        let mut frames = 0;
+        while h.state().fling.is_some() {
+            t += Duration::from_millis(16);
+            let _ = h.send(Event::Window(window::Event::RedrawRequested(t)));
+            frames += 1;
+            assert!(frames < 1000);
+        }
+        // About speed × SLOWDOWN in all (1000 × 0.35), and done in a couple
+        // of seconds.
+        let x = h.offset().x;
+        assert!((300.0..360.0).contains(&x), "{x}");
+        assert!(t - t0 < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_flick_stops_at_the_edge() {
+        let mut h = Harness::new();
+        let t0 = Instant::now();
+        h.state().fling = Some(Fling { velocity: Vector::new(-5000.0, 0.0), last: t0 });
+        let mut t = t0;
+        for _ in 0..20 {
+            t += Duration::from_millis(16);
+            let _ = h.send(Event::Window(window::Event::RedrawRequested(t)));
+        }
+        assert_eq!(h.offset().x, 50.0);
+        assert!(h.state().fling.is_none());
+    }
+
+    #[test]
+    fn velocity_is_kept_for_a_quick_flick_only() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+
+        let mut v = TouchVelocity::default();
+        for i in 1..=5 {
+            v.track(Vector::new(0.0, -16.0), ms(i * 16));
+        }
+        let flick = v.release(ms(85)).expect("a flick");
+        assert!(flick.y < -800.0 && flick.x == 0.0, "{flick:?}");
+
+        // Held still before lifting: stays put.
+        let mut v = TouchVelocity::default();
+        for i in 1..=5 {
+            v.track(Vector::new(0.0, -16.0), ms(i * 16));
+        }
+        assert!(v.release(ms(300)).is_none());
+
+        // A slow drag doesn't glide.
+        let mut v = TouchVelocity::default();
+        for i in 1..=5 {
+            v.track(Vector::new(1.0, 0.0), ms(i * 16));
+        }
+        assert!(v.release(ms(85)).is_none());
+    }
 }

@@ -28,6 +28,7 @@ pub struct Viewer<'a, Handle, Message> {
     on_zoom: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     page: Option<u64>,
     whole: bool,
+    fit_width: bool,
 }
 
 impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
@@ -46,6 +47,7 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
             on_zoom: None,
             page: None,
             whole: false,
+            fit_width: false,
         }
     }
 
@@ -64,6 +66,16 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
     /// page that isn't, unless the user zooms in on this one meanwhile.
     pub fn whole_page(mut self, whole: bool) -> Self {
         self.whole = whole;
+        self
+    }
+
+    /// Fits the image to the viewer's width, from its top (a comic page
+    /// read top to bottom). Turning it on or off eases there quickly from
+    /// wherever the view was. While on, scrolling moves the image instead
+    /// of zooming, zooming is off, each new page starts at its top, and a
+    /// resized viewer keeps the image fitted.
+    pub fn fit_width(mut self, fit: bool) -> Self {
+        self.fit_width = fit;
         self
     }
 
@@ -185,10 +197,17 @@ where
         // (a spread) is zoomed out to fit, and the zoom from before comes
         // back after it.
         let state = tree.state.downcast_mut::<State>();
+        let width_scale = fit_width_scale(renderer, &self.handle, final_size, self.content_fit);
         if self.page.is_some() && state.page != self.page {
             // A flick on the last page doesn't carry over to this one.
             state.fling = None;
-            if state.page.is_some() {
+            if state.page.is_some() && state.fit_width && self.fit_width {
+                // Fitted to width: this page too, from its top.
+                state.ease = None;
+                state.scale = width_scale;
+                state.current_offset = Vector::new(0.0, -hidden_height(renderer, &self.handle, state, final_size, self.content_fit));
+                state.starting_offset = state.current_offset;
+            } else if state.page.is_some() {
                 if self.whole {
                     if state.scale != 1.0 && state.saved_scale.is_none() {
                         state.saved_scale = Some(state.scale);
@@ -206,9 +225,41 @@ where
                 state.starting_offset = state.current_offset;
             }
             state.page = self.page;
-        } else if self.whole && state.scale != 1.0 {
+        } else if self.whole && state.scale != 1.0 && !self.fit_width {
             // Zoomed in on the spread: that zoom carries on from here.
             state.saved_scale = None;
+        }
+
+        if self.fit_width != state.fit_width {
+            // Switched on or off: ease from where the view is now. From
+            // the whole page, Fit to Width starts at the top; from a page
+            // zoomed in by hand, it keeps the part being looked at.
+            state.fit_width = self.fit_width;
+            state.fling = None;
+            state.saved_scale = None;
+            let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
+            let from_offset = state.offset(Rectangle::with_size(final_size), scaled);
+            let (to_scale, to_offset) = if self.fit_width {
+                let mut to = *state;
+                to.scale = width_scale;
+                let hidden = hidden_height(renderer, &self.handle, &to, final_size, self.content_fit);
+                let y = if state.scale <= 1.0 {
+                    -hidden
+                } else {
+                    (from_offset.y * width_scale / state.scale).clamp(-hidden, hidden)
+                };
+                (width_scale, Vector::new(0.0, y))
+            } else {
+                (1.0, Vector::default())
+            };
+            state.ease = Some(Ease { from_scale: state.scale, from_offset, to_scale, to_offset, start: None });
+        } else if self.fit_width && state.ease.is_none() && state.scale != width_scale {
+            // Resized: still as wide as the viewer, at the same place.
+            state.current_offset.y *= width_scale / state.scale;
+            state.scale = width_scale;
+            let hidden = hidden_height(renderer, &self.handle, state, final_size, self.content_fit);
+            state.current_offset = Vector::new(0.0, state.current_offset.y.clamp(-hidden, hidden));
+            state.starting_offset = state.current_offset;
         }
 
         layout::Node::new(final_size)
@@ -249,6 +300,27 @@ where
                 state.fling = None;
                 let is_physical_wheel =
                     state.wheel.is_physical_wheel(delta, Instant::now());
+
+                // Fitted to width: every scroll moves the page, a wheel
+                // notch a good step at a time.
+                if self.fit_width {
+                    if cursor.position_over(bounds).is_none() {
+                        return;
+                    }
+                    state.finish_ease();
+                    let per_line =
+                        if is_physical_wheel { PIXELS_PER_NOTCH } else { PIXELS_PER_LINE };
+                    let moved = match *delta {
+                        mouse::ScrollDelta::Pixels { x, y } => Vector::new(x, y),
+                        mouse::ScrollDelta::Lines { x, y } => {
+                            Vector::new(x * per_line, y * per_line)
+                        }
+                    };
+                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    shell.request_redraw();
+                    shell.capture_event();
+                    return;
+                }
 
                 if !is_physical_wheel && !state.modifiers.control() {
                     let (x, y) = match *delta {
@@ -330,6 +402,13 @@ where
             // A trackpad/touchscreen pinch gesture. `delta` is already a
             // fractional scale change (positive = magnify).
             Event::Mouse(mouse::Event::WheelZoomed { delta }) => {
+                // No zooming while fitted to width.
+                if self.fit_width {
+                    if cursor.is_over(bounds) {
+                        shell.capture_event();
+                    }
+                    return;
+                }
                 let cursor_position =
                     cursor.position_over(bounds).unwrap_or_else(|| bounds.center());
 
@@ -388,6 +467,7 @@ where
                         // A finger on the page stops a flick and takes over
                         // from a mouse drag Windows may have made of it.
                         state.fling = None;
+                        state.finish_ease();
                         state.cursor_grabbed_at = None;
                         if state.touch_a.is_none() {
                             state.touch_a = Some((id, position));
@@ -433,7 +513,7 @@ where
                                 Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
 
                             if let Some(prev) = state.pinch_last_dist {
-                                if prev > 1.0 {
+                                if prev > 1.0 && !self.fit_width {
                                     let previous_scale = state.scale;
                                     let new_scale = (state.scale
                                         * (dist / prev))
@@ -520,6 +600,20 @@ where
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let state = tree.state.downcast_mut::<State>();
+                if let Some(ease) = state.ease.as_mut() {
+                    let start = *ease.start.get_or_insert(*now);
+                    let t = (now.saturating_duration_since(start).as_secs_f32()
+                        / Ease::DURATION.as_secs_f32())
+                    .min(1.0);
+                    let e = *ease;
+                    state.apply_ease(&e, t);
+                    if t >= 1.0 {
+                        state.ease = None;
+                    } else {
+                        shell.request_redraw();
+                    }
+                    return;
+                }
                 let Some(fling) = state.fling.as_mut() else {
                     return;
                 };
@@ -561,6 +655,7 @@ where
                 }
 
                 state.fling = None;
+                state.finish_ease();
                 state.cursor_grabbed_at = Some(cursor_position);
                 state.starting_offset = state.current_offset;
 
@@ -717,6 +812,10 @@ pub struct State {
     /// The zoom to return to after a page shown whole.
     saved_scale: Option<f32>,
     wheel: WheelSource,
+    /// Whether the image was last laid out fitted to width.
+    fit_width: bool,
+    /// Easing into or out of Fit to Width.
+    ease: Option<Ease>,
 }
 
 impl Default for State {
@@ -737,6 +836,8 @@ impl Default for State {
             page: None,
             saved_scale: None,
             wheel: WheelSource::default(),
+            fit_width: false,
+            ease: None,
         }
     }
 }
@@ -820,6 +921,59 @@ impl Fling {
 
 /// How far a Windows touchpad pans per "line" it reports.
 const PIXELS_PER_LINE: f32 = 40.0;
+
+/// How far a mouse wheel notch scrolls a page fitted to width.
+const PIXELS_PER_NOTCH: f32 = 120.0;
+
+/// A quick move between two zooms (into or out of Fit to Width): fast
+/// enough to feel like a snap, slow enough to see where the page went.
+#[derive(Debug, Clone, Copy)]
+struct Ease {
+    from_scale: f32,
+    from_offset: Vector,
+    to_scale: f32,
+    to_offset: Vector,
+    /// Set by the first frame drawn.
+    start: Option<Instant>,
+}
+
+impl Ease {
+    const DURATION: Duration = Duration::from_millis(160);
+}
+
+/// The scale (relative to `content_fit`) at which the image is exactly as
+/// wide as `bounds`; 1.0 when it already fills the width.
+fn fit_width_scale<Renderer>(
+    renderer: &Renderer,
+    handle: &<Renderer as image::Renderer>::Handle,
+    bounds: Size,
+    content_fit: ContentFit,
+) -> f32
+where
+    Renderer: image::Renderer,
+{
+    let Size { width, height } = renderer.measure_image(handle).unwrap_or_default();
+    let fitted = content_fit.fit(Size::new(width as f32, height as f32), bounds);
+    if fitted.width <= 0.0 {
+        return 1.0;
+    }
+    (bounds.width / fitted.width).max(1.0)
+}
+
+/// How far the image reaches past the top (and bottom) of `bounds`.
+fn hidden_height<Renderer>(
+    renderer: &Renderer,
+    handle: &<Renderer as image::Renderer>::Handle,
+    state: &State,
+    bounds: Size,
+    content_fit: ContentFit,
+) -> f32
+where
+    Renderer: image::Renderer,
+{
+    let scaled = scaled_image_size(renderer, handle, state, bounds, content_fit);
+    ((scaled.height - bounds.height) / 2.0).max(0.0).round()
+}
 
 /// Tells a mouse wheel from a touchpad's two-finger scroll.
 ///
@@ -1004,6 +1158,22 @@ impl State {
             self.current_offset.x.clamp(-hidden_width, hidden_width),
             self.current_offset.y.clamp(-hidden_height, hidden_height),
         )
+    }
+
+    /// Moves `t` (0 to 1) of the way through `ease`, slowing into the end.
+    fn apply_ease(&mut self, ease: &Ease, t: f32) {
+        let e = 1.0 - (1.0 - t).powi(3);
+        self.scale = ease.from_scale + (ease.to_scale - ease.from_scale) * e;
+        self.current_offset = ease.from_offset + (ease.to_offset - ease.from_offset) * e;
+        self.starting_offset = self.current_offset;
+    }
+
+    /// Jumps to the end of an ease under way, so input acts on where the
+    /// view is going.
+    fn finish_ease(&mut self) {
+        if let Some(ease) = self.ease.take() {
+            self.apply_ease(&ease, 1.0);
+        }
     }
 
     /// Starts a touch gesture over from the fingers now down: a pinch
@@ -1290,5 +1460,190 @@ mod touch_tests {
             v.track(Vector::new(1.0, 0.0), ms(i * 16));
         }
         assert!(v.release(ms(85)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fit_width_tests {
+    use super::*;
+    use crate::core::clipboard;
+
+    /// A 300×100 viewer on the null renderer (images measure 100×100): the
+    /// whole page is 100×100, fitted to width it's 300×300.
+    struct Harness {
+        viewer: Viewer<'static, image::Handle, ()>,
+        tree: Tree,
+        size: Size,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Harness {
+                viewer: Self::viewer(false, 1),
+                tree: Tree {
+                    tag: tree::Tag::of::<State>(),
+                    id: None,
+                    state: tree::State::new(State::default()),
+                    children: Vec::new(),
+                },
+                size: Size::new(300.0, 100.0),
+            }
+        }
+
+        fn viewer(fit: bool, page: u64) -> Viewer<'static, image::Handle, ()> {
+            Viewer::new(image::Handle::from_rgba(1, 1, vec![0; 4]))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .page(page)
+                .fit_width(fit)
+        }
+
+        /// Rebuilds the viewer (as the app's view does) and lays it out.
+        fn show(&mut self, fit: bool, page: u64) {
+            self.viewer = Self::viewer(fit, page);
+            let _ = Widget::<(), (), ()>::layout(
+                &mut self.viewer,
+                &mut self.tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, self.size),
+            );
+        }
+
+        fn send(&mut self, event: Event, cursor: mouse::Cursor) {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            let node = layout::Node::new(self.size);
+            Widget::<(), (), ()>::update(
+                &mut self.viewer,
+                &mut self.tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &(),
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(self.size),
+            );
+        }
+
+        fn frame(&mut self, at: Instant) {
+            self.send(Event::Window(window::Event::RedrawRequested(at)), mouse::Cursor::Unavailable);
+        }
+
+        /// Plays an ease to its end.
+        fn settle(&mut self) {
+            let t0 = Instant::now();
+            self.frame(t0);
+            self.frame(t0 + Duration::from_millis(500));
+        }
+
+        fn wheel(&mut self, delta: mouse::ScrollDelta) {
+            self.send(
+                Event::Mouse(mouse::Event::WheelScrolled { delta }),
+                mouse::Cursor::Available(Point::new(150.0, 50.0)),
+            );
+        }
+
+        fn state(&mut self) -> &mut State {
+            self.tree.state.downcast_mut::<State>()
+        }
+    }
+
+    #[test]
+    fn eases_to_the_full_width_from_the_top() {
+        let mut h = Harness::new();
+        h.show(false, 1);
+        h.show(true, 1);
+        let t0 = Instant::now();
+        h.frame(t0);
+        assert_eq!(h.state().scale, 1.0);
+        h.frame(t0 + Duration::from_millis(80));
+        let mid = h.state().scale;
+        assert!(mid > 1.0 && mid < 3.0, "{mid}");
+        h.frame(t0 + Duration::from_millis(200));
+        assert_eq!(h.state().scale, 3.0);
+        // 300 px tall in a 100 px view: 100 px above and below, at the top.
+        assert_eq!(h.state().current_offset, Vector::new(0.0, -100.0));
+        assert!(h.state().ease.is_none());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_instead_of_zooming() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        h.wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+        assert_eq!(h.state().scale, 3.0);
+        assert_eq!(h.state().current_offset.y, -100.0 + PIXELS_PER_NOTCH);
+        // A trackpad moves it by its pixels; the bottom edge stops it.
+        h.wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -500.0 });
+        assert_eq!(h.state().current_offset.y, 100.0);
+        assert_eq!(h.state().scale, 3.0);
+    }
+
+    #[test]
+    fn a_pinch_does_not_zoom() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        h.send(
+            Event::Mouse(mouse::Event::WheelZoomed { delta: 0.5 }),
+            mouse::Cursor::Available(Point::new(150.0, 50.0)),
+        );
+        assert_eq!(h.state().scale, 3.0);
+    }
+
+    #[test]
+    fn a_new_page_starts_at_its_top_still_fitted() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        h.wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -150.0 });
+        h.show(true, 2);
+        assert_eq!(h.state().scale, 3.0);
+        assert_eq!(h.state().current_offset.y, -100.0);
+    }
+
+    #[test]
+    fn turning_it_off_eases_back_to_the_whole_page() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        h.show(false, 1);
+        h.settle();
+        assert_eq!(h.state().scale, 1.0);
+        assert_eq!(h.state().current_offset, Vector::default());
+    }
+
+    #[test]
+    fn from_a_zoom_by_hand_it_keeps_the_place() {
+        let mut h = Harness::new();
+        h.show(false, 1);
+        h.state().scale = 2.0;
+        h.state().current_offset = Vector::new(40.0, 20.0);
+        h.show(true, 1);
+        h.settle();
+        assert_eq!(h.state().scale, 3.0);
+        assert_eq!(h.state().current_offset, Vector::new(0.0, 30.0));
+    }
+
+    #[test]
+    fn a_resized_window_stays_fitted() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        h.size = Size::new(200.0, 100.0);
+        h.show(true, 1);
+        assert_eq!(h.state().scale, 2.0);
+        assert_eq!(h.state().current_offset.y, -50.0);
+    }
+
+    #[test]
+    fn a_page_narrower_than_the_window_is_never_shrunk() {
+        let mut h = Harness::new();
+        h.size = Size::new(100.0, 300.0);
+        h.show(true, 1);
+        h.settle();
+        assert_eq!(h.state().scale, 1.0);
     }
 }

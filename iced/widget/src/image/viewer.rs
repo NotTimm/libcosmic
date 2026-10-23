@@ -284,7 +284,8 @@ where
                 state.modifiers = *modifiers;
             }
             // A physical mouse wheel reports discrete `Lines` notches, so it
-            // can only ever mean "zoom" here and needs no modifier. A
+            // means "zoom" here and needs no modifier (with Ctrl, or Cmd on
+            // a Mac, it scrolls the page instead; see below). A
             // trackpad's two-finger scroll reports continuous `Pixels`; with
             // Ctrl held that also zooms, but without Ctrl it pans instead
             // (free diagonal movement, since x and y move independently —
@@ -315,6 +316,33 @@ where
                         mouse::ScrollDelta::Lines { x, y } => {
                             Vector::new(x * per_line, y * per_line)
                         }
+                    };
+                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    shell.request_redraw();
+                    shell.capture_event();
+                    return;
+                }
+
+                // A mouse wheel with Ctrl (Cmd on a Mac) held scrolls a
+                // zoomed page, a notch at a time, so a desktop can zoom with
+                // the wheel and then read down the page like a trackpad.
+                // Shift as well scrolls sideways. Only a real wheel: Windows
+                // sends a touchpad pinch as Ctrl + wheel, which must zoom.
+                if is_physical_wheel && state.modifiers.command() {
+                    if cursor.position_over(bounds).is_none() {
+                        return;
+                    }
+                    let (x, y) = match *delta {
+                        mouse::ScrollDelta::Pixels { x, y } => (x, y),
+                        mouse::ScrollDelta::Lines { x, y } => {
+                            (x * PIXELS_PER_NOTCH, y * PIXELS_PER_NOTCH)
+                        }
+                    };
+                    let moved = if state.modifiers.shift() {
+                        // Some systems already turn Shift + wheel sideways.
+                        Vector::new(if y == 0.0 { x } else { y }, 0.0)
+                    } else {
+                        Vector::new(x, y)
                     };
                     let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
                     shell.request_redraw();
@@ -1579,6 +1607,38 @@ mod fit_width_tests {
         h.wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -500.0 });
         assert_eq!(h.state().current_offset.y, 100.0);
         assert_eq!(h.state().scale, 3.0);
+    }
+
+    #[test]
+    fn ctrl_and_the_wheel_scroll_a_zoomed_page() {
+        let mut h = Harness::new();
+        h.show(false, 1);
+        h.state().scale = 6.0;
+        h.state().current_offset = Vector::new(0.0, -100.0);
+        h.send(
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::COMMAND)),
+            mouse::Cursor::Unavailable,
+        );
+        h.wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+        assert_eq!(h.state().scale, 6.0);
+        assert_eq!(h.state().current_offset.y, -100.0 + PIXELS_PER_NOTCH);
+        // With Shift too it goes sideways (600 px wide in a 300 px view).
+        h.send(
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            )),
+            mouse::Cursor::Unavailable,
+        );
+        h.wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+        assert_eq!(h.state().scale, 6.0);
+        assert_eq!(h.state().current_offset.x, PIXELS_PER_NOTCH);
+        // Without Ctrl the wheel zooms again.
+        h.send(
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty())),
+            mouse::Cursor::Unavailable,
+        );
+        h.wheel(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        assert!(h.state().scale > 6.0);
     }
 
     #[test]

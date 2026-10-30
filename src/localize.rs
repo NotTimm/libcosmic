@@ -47,3 +47,13 @@ pub fn localize() {
         }
     });
 }
+
+/// Switches libcosmic's own strings (Close, Cancel...) to `requested`, the
+/// app's language choice in order of preference, instead of the desktop's.
+/// Takes effect on the next redraw.
+pub fn select(requested: &[i18n_embed::unic_langid::LanguageIdentifier]) {
+    LOCALIZATION_INITIALIZED.get_or_init(|| ());
+    if let Err(error) = localizer().select(requested) {
+        eprintln!("Error while loading language for libcosmic {}", error);
+    }
+}

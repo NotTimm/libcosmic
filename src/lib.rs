@@ -153,7 +153,8 @@ pub use iced;
 pub mod icon_theme;
 pub mod keyboard_nav;
 
-mod localize;
+/// Lets an app pick the language of libcosmic's own strings.
+pub mod localize;
 
 #[cfg(all(target_env = "gnu", not(target_os = "windows")))]
 pub(crate) mod malloc;

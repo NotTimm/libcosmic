@@ -283,6 +283,56 @@ where
                 let state = tree.state.downcast_mut::<State>();
                 state.modifiers = *modifiers;
             }
+            // Up and Down scroll the page while held: from a quick start up
+            // to a steady speed, gliding briefly to a stop when let go, so
+            // the keyboard alone can read down a zoomed page. Repeats are
+            // ignored (the speed comes from frame times, not the repeat
+            // rate), and a key taken by something else (a text field) or
+            // pressed with Ctrl, Alt or Cmd is left alone.
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, repeat, .. }) => {
+                let Some(dir) = key_scroll_direction(key) else {
+                    return;
+                };
+                if shell.is_event_captured()
+                    || modifiers.control()
+                    || modifiers.alt()
+                    || modifiers.logo()
+                {
+                    return;
+                }
+                let state = tree.state.downcast_mut::<State>();
+                shell.capture_event();
+                if *repeat && state.key_scroll.is_some_and(|k| k.dir == dir) {
+                    return;
+                }
+                state.finish_ease();
+                state.fling = None;
+                state.cursor_grabbed_at = None;
+                let height = bounds.height;
+                state.key_scroll = Some(KeyScroll {
+                    dir,
+                    speed: KeyScroll::top_speed(height) * KeyScroll::START,
+                    last: Instant::now(),
+                });
+                shell.request_redraw();
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                let state = tree.state.downcast_mut::<State>();
+                let Some(scroll) = state.key_scroll else {
+                    return;
+                };
+                if key_scroll_direction(key) != Some(scroll.dir) {
+                    return;
+                }
+                state.key_scroll = None;
+                state.fling = Some(scroll.glide(Instant::now()));
+                shell.request_redraw();
+            }
+            // The release may never come once the window loses focus.
+            Event::Window(window::Event::Unfocused) => {
+                let state = tree.state.downcast_mut::<State>();
+                state.key_scroll = None;
+            }
             // A physical mouse wheel reports discrete `Lines` notches, so it
             // means "zoom" here and needs no modifier (with Ctrl, or Cmd on
             // a Mac, it scrolls the page instead; see below). A
@@ -610,6 +660,7 @@ where
                                 state.fling = Some(Fling {
                                     velocity,
                                     last: now,
+                                    slowdown: Fling::SLOWDOWN,
                                 });
                                 shell.request_redraw();
                             }
@@ -640,6 +691,12 @@ where
                     } else {
                         shell.request_redraw();
                     }
+                    return;
+                }
+                if let Some(scroll) = state.key_scroll.as_mut() {
+                    let moved = scroll.step(*now, bounds.height);
+                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    shell.request_redraw();
                     return;
                 }
                 let Some(fling) = state.fling.as_mut() else {
@@ -844,6 +901,8 @@ pub struct State {
     fit_width: bool,
     /// Easing into or out of Fit to Width.
     ease: Option<Ease>,
+    /// Up or Down held.
+    key_scroll: Option<KeyScroll>,
 }
 
 impl Default for State {
@@ -866,6 +925,7 @@ impl Default for State {
             wheel: WheelSource::default(),
             fit_width: false,
             ease: None,
+            key_scroll: None,
         }
     }
 }
@@ -921,11 +981,13 @@ struct Fling {
     /// Pixels per second, in the direction the page moves.
     velocity: Vector,
     last: Instant,
+    /// How quickly the glide slows: the speed falls to about a third every
+    /// this many seconds, and it travels its speed times this in all.
+    slowdown: f32,
 }
 
 impl Fling {
-    /// How quickly the glide slows: the speed falls to about a third every
-    /// this many seconds, and a flick travels its speed times this in all.
+    /// A flicked finger's glide.
     const SLOWDOWN: f32 = 0.35;
     const STOP: f32 = 20.0;
 
@@ -938,12 +1000,68 @@ impl Fling {
             .min(0.05);
         self.last = now;
         let moved = self.velocity * dt;
-        self.velocity = self.velocity * (-dt / Self::SLOWDOWN).exp();
+        self.velocity = self.velocity * (-dt / self.slowdown).exp();
         moved
     }
 
     fn is_done(&self) -> bool {
         self.velocity.x.abs() < Self::STOP && self.velocity.y.abs() < Self::STOP
+    }
+}
+
+/// Up or Down held: the page scrolls at a speed that follows the viewer's
+/// height, so a screenful takes about as long on any display.
+#[derive(Debug, Clone, Copy)]
+struct KeyScroll {
+    /// -1.0 for Up, 1.0 for Down.
+    dir: f32,
+    /// Pixels per second now.
+    speed: f32,
+    last: Instant,
+}
+
+impl KeyScroll {
+    /// Screenfuls per second once up to speed.
+    const SCREENS_PER_SECOND: f32 = 0.9;
+    /// Pixels per second, at least and at most.
+    const MIN_SPEED: f32 = 450.0;
+    const MAX_SPEED: f32 = 1400.0;
+    /// The share of the top speed it starts at, so a tap moves too.
+    const START: f32 = 0.6;
+    /// Seconds from the start to the top speed.
+    const RAMP: f32 = 0.15;
+    /// The glide after letting go (see `Fling::slowdown`).
+    const GLIDE: f32 = 0.1;
+
+    fn top_speed(height: f32) -> f32 {
+        (height * Self::SCREENS_PER_SECOND).clamp(Self::MIN_SPEED, Self::MAX_SPEED)
+    }
+
+    /// How far the page moves this frame (as `pan_by` takes it).
+    fn step(&mut self, now: Instant, height: f32) -> Vector {
+        let dt = now.saturating_duration_since(self.last).as_secs_f32().min(0.05);
+        self.last = now;
+        let top = Self::top_speed(height);
+        self.speed =
+            (self.speed + top * (1.0 - Self::START) * dt / Self::RAMP).min(top);
+        Vector::new(0.0, -self.dir * self.speed * dt)
+    }
+
+    /// Slows to a stop from the speed it had.
+    fn glide(&self, now: Instant) -> Fling {
+        Fling {
+            velocity: Vector::new(0.0, -self.dir * self.speed),
+            last: now,
+            slowdown: Self::GLIDE,
+        }
+    }
+}
+
+fn key_scroll_direction(key: &keyboard::Key) -> Option<f32> {
+    match key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(-1.0),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(1.0),
+        _ => None,
     }
 }
 
@@ -1428,12 +1546,111 @@ mod touch_tests {
         assert!(!h.state().is_cursor_grabbed());
     }
 
+    fn arrow(named: keyboard::key::Named, pressed: bool) -> Event {
+        let key = keyboard::Key::Named(named);
+        Event::Keyboard(if pressed {
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+                text: None,
+                repeat: false,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+            }
+        })
+    }
+
+    /// Runs frames 16 ms apart from the key scroll's start.
+    fn frames(h: &mut Harness, n: u32) {
+        let mut t = h.state().key_scroll.map_or_else(Instant::now, |k| k.last);
+        for _ in 0..n {
+            t += Duration::from_millis(16);
+            let _ = h.send(Event::Window(window::Event::RedrawRequested(t)));
+        }
+    }
+
+    #[test]
+    fn down_held_scrolls_down_and_stops_at_the_bottom() {
+        use keyboard::key::Named;
+        let mut h = Harness::new();
+        h.state().scale = 20.0; // 950 px hidden above and below
+        assert!(h.send(arrow(Named::ArrowDown, true)));
+        frames(&mut h, 6); // ~0.1 s
+        let y = h.offset().y;
+        // From 60% of the 450 px/s floor up towards it.
+        assert!((25.0..45.0).contains(&y), "{y}");
+        frames(&mut h, 600);
+        assert_eq!(h.offset().y, 950.0);
+        let _ = h.send(arrow(Named::ArrowDown, false));
+        assert!(h.state().key_scroll.is_none());
+    }
+
+    #[test]
+    fn up_scrolls_up_and_letting_go_glides_briefly() {
+        use keyboard::key::Named;
+        let mut h = Harness::new();
+        h.state().scale = 20.0;
+        let _ = h.send(arrow(Named::ArrowUp, true));
+        frames(&mut h, 30); // ~0.5 s, at full speed
+        let held = h.offset().y;
+        assert!(held < -150.0, "{held}");
+        let _ = h.send(arrow(Named::ArrowUp, false));
+        let t0 = h.state().fling.expect("a glide").last;
+        let mut t = t0;
+        while h.state().fling.is_some() {
+            t += Duration::from_millis(16);
+            let _ = h.send(Event::Window(window::Event::RedrawRequested(t)));
+        }
+        // About 450 px/s × 0.1 s more.
+        let glide = held - h.offset().y;
+        assert!((30.0..55.0).contains(&glide), "{glide}");
+        assert!(t - t0 < Duration::from_millis(600));
+    }
+
+    #[test]
+    fn other_keys_and_ctrl_arrows_are_left_alone() {
+        use keyboard::key::Named;
+        let mut h = Harness::new();
+        assert!(!h.send(arrow(Named::ArrowLeft, true)));
+        let _ = h.send(Event::Keyboard(keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::CTRL,
+        )));
+        let mut ctrl = arrow(Named::ArrowDown, true);
+        if let Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. }) = &mut ctrl {
+            *modifiers = keyboard::Modifiers::CTRL;
+        }
+        assert!(!h.send(ctrl));
+        assert!(h.state().key_scroll.is_none());
+    }
+
+    #[test]
+    fn losing_focus_stops_a_held_key() {
+        use keyboard::key::Named;
+        let mut h = Harness::new();
+        let _ = h.send(arrow(Named::ArrowDown, true));
+        let _ = h.send(Event::Window(window::Event::Unfocused));
+        assert!(h.state().key_scroll.is_none());
+    }
+
     #[test]
     fn a_flick_glides_on_and_stops() {
         let mut h = Harness::new();
         h.state().scale = 10.0; // plenty of room to glide
         let t0 = Instant::now();
-        h.state().fling = Some(Fling { velocity: Vector::new(-1000.0, 0.0), last: t0 });
+        h.state().fling = Some(Fling { velocity: Vector::new(-1000.0, 0.0), last: t0, slowdown: Fling::SLOWDOWN });
         let mut t = t0;
         let mut frames = 0;
         while h.state().fling.is_some() {
@@ -1453,7 +1670,7 @@ mod touch_tests {
     fn a_flick_stops_at_the_edge() {
         let mut h = Harness::new();
         let t0 = Instant::now();
-        h.state().fling = Some(Fling { velocity: Vector::new(-5000.0, 0.0), last: t0 });
+        h.state().fling = Some(Fling { velocity: Vector::new(-5000.0, 0.0), last: t0, slowdown: Fling::SLOWDOWN });
         let mut t = t0;
         for _ in 0..20 {
             t += Duration::from_millis(16);

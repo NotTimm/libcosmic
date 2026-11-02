@@ -72,6 +72,21 @@ pub trait Paragraph: Sized + Default {
     /// Returns the distance to the given grapheme index in the [`Paragraph`].
     fn grapheme_position(&self, line: usize, index: usize) -> Option<Point>;
 
+    /// The byte offset in the whole text (its lines joined by `\n`) of the
+    /// character boundary nearest to the point, for selecting text.
+    fn hit_offset(&self, point: Point) -> Option<usize> {
+        match self.hit_test(point)? {
+            Hit::CharOffset(index, _) => Some(index),
+        }
+    }
+
+    /// The areas covering the text between two byte offsets of the whole
+    /// text (as [`Paragraph::hit_offset`] counts them), one per visual
+    /// line, for drawing a selection.
+    fn range_bounds(&self, _start: usize, _end: usize) -> Vec<Rectangle> {
+        Vec::new()
+    }
+
     /// Returns the visual position of a cursor at the given byte index and [`Affinity`].
     fn cursor_position(
         &self,

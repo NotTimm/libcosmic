@@ -3,7 +3,7 @@ mod rich;
 
 pub use crate::core::text::{Fragment, Highlighter, IntoFragment, Span};
 pub use crate::core::widget::text::*;
-pub use rich::Rich;
+pub use rich::{Rich, Select};
 
 /// A bunch of text.
 ///

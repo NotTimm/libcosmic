@@ -38,6 +38,33 @@ pub struct Rich<
     class: Theme::Class<'a>,
     hovered_link: Option<usize>,
     on_link_click: Option<Box<dyn Fn(Link) -> Message + 'a>>,
+    selection: Option<(usize, usize, Color)>,
+    on_select: Option<Box<dyn Fn(Select) -> Message + 'a>>,
+    dragging: bool,
+}
+
+/// Where the mouse is in a [`Rich`] text that can be selected, as a byte
+/// offset into its spans' text joined together.
+///
+/// The text only reports these; the app keeps the selection (which can
+/// run across many texts) and hands each text its part with
+/// [`Rich::selection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Select {
+    /// The left button went down on the text: a new selection starts.
+    /// `clicks` is 1, 2 (a word) or 3 (the whole text).
+    Press {
+        /// The offset under the mouse.
+        offset: usize,
+        /// Single, double or triple click.
+        clicks: u8,
+    },
+    /// The mouse moved over the text while the app says a selection is
+    /// being dragged ([`Rich::dragging`]).
+    Drag {
+        /// The offset under the mouse.
+        offset: usize,
+    },
 }
 
 impl<'a, Link, Message, Theme, Renderer>
@@ -64,6 +91,9 @@ where
             class: Theme::default(),
             hovered_link: None,
             on_link_click: None,
+            selection: None,
+            on_select: None,
+            dragging: false,
         }
     }
 
@@ -148,6 +178,28 @@ where
         self
     }
 
+    /// Makes the text selectable: pressing on it and dragging over it
+    /// produce [`Select`] messages.
+    pub fn on_select(mut self, on_select: impl Fn(Select) -> Message + 'a) -> Self {
+        self.on_select = Some(Box::new(on_select));
+        self
+    }
+
+    /// Whether a selection is being dragged (somewhere), so moving over this
+    /// text reports [`Select::Drag`].
+    pub fn dragging(mut self, dragging: bool) -> Self {
+        self.dragging = dragging;
+        self
+    }
+
+    /// The selected part of the text (byte offsets into its spans' text
+    /// joined together; an `end` past the text means to its end), drawn
+    /// behind the text in `color`.
+    pub fn selection(mut self, range: Option<(usize, usize)>, color: Color) -> Self {
+        self.selection = range.map(|(start, end)| (start, end, color));
+        self
+    }
+
     /// Sets the [`Ellipsize`] strategy of the [`Rich`] text.
     pub fn ellipsize(mut self, ellipsize: Ellipsize) -> Self {
         self.ellipsize = ellipsize;
@@ -211,6 +263,10 @@ struct State<Link, P: Paragraph> {
     spans: Vec<Span<'static, Link, P::Font>>,
     span_pressed: Option<usize>,
     paragraph: P,
+    last_click: Option<mouse::Click>,
+    /// The offset last reported while dragging, so a move within one
+    /// character isn't reported again.
+    last_drag: Option<usize>,
 }
 
 impl<Link, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -229,6 +285,8 @@ where
             spans: Vec::new(),
             span_pressed: None,
             paragraph: Renderer::Paragraph::default(),
+            last_click: None,
+            last_drag: None,
         })
     }
 
@@ -282,6 +340,19 @@ where
             .downcast_ref::<State<Link, Renderer::Paragraph>>();
 
         let style = theme.style(&self.class);
+
+        if let Some((start, end, color)) = self.selection {
+            let translation = layout.position() - Point::ORIGIN;
+            for bounds in state.paragraph.range_bounds(start, end) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: bounds + translation,
+                        ..Default::default()
+                    },
+                    color,
+                );
+            }
+        }
 
         for (index, span) in self.spans.as_ref().as_ref().iter().enumerate() {
             let is_hovered_link = self.on_link_click.is_some()
@@ -396,6 +467,54 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if let Some(on_select) = &self.on_select {
+            let state = tree
+                .state
+                .downcast_mut::<State<Link, Renderer::Paragraph>>();
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    if let Some(position) = cursor.position_in(layout.bounds()) {
+                        let click = mouse::Click::new(
+                            position,
+                            mouse::Button::Left,
+                            state.last_click,
+                        );
+                        state.last_click = Some(click);
+                        state.last_drag = None;
+                        let clicks = match click.kind() {
+                            mouse::click::Kind::Single => 1,
+                            mouse::click::Kind::Double => 2,
+                            mouse::click::Kind::Triple => 3,
+                        };
+                        if let Some(offset) = state.paragraph.hit_offset(position) {
+                            state.last_drag = Some(offset);
+                            shell.publish(on_select(Select::Press { offset, clicks }));
+                        }
+                        shell.capture_event();
+                    }
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) if self.dragging => {
+                    if let Some(position) = cursor.position_in(layout.bounds()) {
+                        if let Some(offset) = state.paragraph.hit_offset(position) {
+                            if state.last_drag != Some(offset) {
+                                // Dragging from a link selects; it doesn't
+                                // follow the link.
+                                if state.last_drag.is_some() {
+                                    state.span_pressed = None;
+                                }
+                                state.last_drag = Some(offset);
+                                shell.publish(on_select(Select::Drag { offset }));
+                            }
+                        }
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    state.last_drag = None;
+                }
+                _ => {}
+            }
+        }
+
         let Some(on_link_clicked) = &self.on_link_click else {
             return;
         };
@@ -463,13 +582,15 @@ where
     fn mouse_interaction(
         &self,
         _tree: &Tree,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if self.hovered_link.is_some() {
             mouse::Interaction::Pointer
+        } else if self.on_select.is_some() && cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Text
         } else {
             mouse::Interaction::None
         }

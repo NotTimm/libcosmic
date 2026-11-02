@@ -363,6 +363,58 @@ impl core::text::Paragraph for Paragraph {
         bounds
     }
 
+    fn hit_offset(&self, point: Point) -> Option<usize> {
+        let buffer = &self.internal().buffer;
+        let cursor = buffer.hit(point.x, point.y)?;
+        let before: usize = buffer
+            .lines
+            .iter()
+            .take(cursor.line)
+            .map(|line| line.text().len() + 1)
+            .sum();
+
+        Some(before + cursor.index)
+    }
+
+    fn range_bounds(&self, start: usize, end: usize) -> Vec<Rectangle> {
+        let buffer = &self.internal().buffer;
+        if start >= end {
+            return Vec::new();
+        }
+
+        // Byte offsets of the whole text to (line, index) cursors.
+        let to_cursor = |offset: usize, end: bool| {
+            let mut rest = offset;
+            for (i, line) in buffer.lines.iter().enumerate() {
+                let len = line.text().len();
+                if rest <= len {
+                    return cosmic_text::Cursor::new(i, rest);
+                }
+                rest -= len + 1;
+            }
+            let last = buffer.lines.len().saturating_sub(1);
+            let len = buffer.lines.last().map_or(0, |line| line.text().len());
+            cosmic_text::Cursor::new(last, if end { len } else { 0 })
+        };
+        let from = to_cursor(start, false);
+        let to = to_cursor(end, true);
+
+        buffer
+            .layout_runs()
+            // `highlight` takes any other line as wholly selected.
+            .filter(|run| from.line <= run.line_i && run.line_i <= to.line)
+            .flat_map(|run| {
+                let (top, height) = (run.line_top, run.line_height);
+                run.highlight(from, to)
+                    .map(move |(x, width)| {
+                        Rectangle::new(Point::new(x, top), Size::new(width, height))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|bounds| bounds.width > 0.0)
+            .collect()
+    }
+
     fn grapheme_position(&self, line: usize, index: usize) -> Option<Point> {
         use unicode_segmentation::UnicodeSegmentation;
 

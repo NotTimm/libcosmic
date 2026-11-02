@@ -493,8 +493,21 @@ where
                         shell.capture_event();
                     }
                 }
-                Event::Mouse(mouse::Event::CursorMoved { .. }) if self.dragging => {
-                    if let Some(position) = cursor.position_in(layout.bounds()) {
+                // Every frame too, not only on moves: while the app scrolls
+                // the page under a still mouse, the text under it changes.
+                // A scrollable hands a mouse outside it on as levitating;
+                // a drag follows it there.
+                Event::Mouse(mouse::Event::CursorMoved { .. })
+                | Event::Window(core::window::Event::RedrawRequested(_))
+                    if self.dragging =>
+                {
+                    let bounds = layout.bounds();
+                    let local = cursor
+                        .land()
+                        .position()
+                        .filter(|p| bounds.contains(*p))
+                        .map(|p| p - Vector::new(bounds.x, bounds.y));
+                    if let Some(position) = local {
                         if let Some(offset) = state.paragraph.hit_offset(position) {
                             if state.last_drag != Some(offset) {
                                 // Dragging from a link selects; it doesn't

@@ -3,7 +3,7 @@ use crate::color::{ColorRepr, ColorReprOption, color_serde};
 use crate::composite::over;
 use crate::steps::{color_index, get_small_widget_color, get_surface_color, get_text, steps};
 use crate::{
-    Component, Container, CornerRadii, CosmicPalette, CosmicPaletteInner, DARK_PALETTE,
+    Component, Container, CornerRadii, CosmicPalette, CosmicPaletteInner, DARK_PALETTE, FontConfig,
     LIGHT_PALETTE, NAME, Spacing, ThemeMode,
 };
 use cosmic_config::{Config, CosmicConfigEntry};
@@ -24,6 +24,17 @@ pub const LIGHT_THEME_BUILDER_ID: &str = "com.system76.CosmicTheme.Light.Builder
 
 /// ID for the current light Theme config
 pub const LIGHT_THEME_ID: &str = "com.system76.CosmicTheme.Light";
+
+/// Default icon theme used when none is configured.
+pub const DEFAULT_ICON_THEME: &str = "Cosmic";
+
+fn default_icon_theme() -> String {
+    DEFAULT_ICON_THEME.to_string()
+}
+
+fn default_mono_font() -> FontConfig {
+    FontConfig::monospace()
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 /// Theme layer type
@@ -143,6 +154,18 @@ pub struct Theme {
     #[serde(with = "color_serde_option")]
     #[cosmic_config_entry(with = ColorReprOption)]
     pub text_tint: Option<Srgb>,
+    /// name of the icon theme
+    #[serde(default = "default_icon_theme")]
+    pub icon_theme: String,
+    /// name of the cursor theme. `None` uses the session default (`$XCURSOR_THEME`)
+    #[serde(default)]
+    pub cursor_theme: Option<String>,
+    /// interface font
+    #[serde(default)]
+    pub font: FontConfig,
+    /// monospace font
+    #[serde(default = "default_mono_font")]
+    pub mono_font: FontConfig,
 }
 
 impl Default for Theme {
@@ -759,7 +782,7 @@ impl Theme {
     #[allow(clippy::result_large_err)]
     pub fn get_active() -> Result<Self, (Vec<cosmic_config::Error>, Self)> {
         (|| {
-            (if ThemeMode::is_dark(&Config::new(Self::id(), Self::VERSION)?)? {
+            (if ThemeMode::is_dark(&ThemeMode::config()?)? {
                 Self::dark_config
             } else {
                 Self::light_config
@@ -789,7 +812,12 @@ impl Theme {
                 .and_then(|h| ThemeBuilder::get_entry(&h).ok())
                 .unwrap_or_else(ThemeBuilder::light)
         };
-        builder = builder.accent(adjusted_c);
+        builder = builder
+            .accent(adjusted_c)
+            .icon_theme(self.icon_theme.clone())
+            .cursor_theme(self.cursor_theme.clone())
+            .font(self.font.clone())
+            .mono_font(self.mono_font.clone());
         builder.build()
     }
 
@@ -917,6 +945,18 @@ pub struct ThemeBuilder {
     #[serde(default)]
     /// alpha map
     pub alpha_map: AlphaMap,
+    /// name of the icon theme
+    #[serde(default = "default_icon_theme")]
+    pub icon_theme: String,
+    /// name of the cursor theme. `None` uses the session default (`$XCURSOR_THEME`)
+    #[serde(default)]
+    pub cursor_theme: Option<String>,
+    /// interface font
+    #[serde(default)]
+    pub font: FontConfig,
+    /// monospace font
+    #[serde(default = "default_mono_font")]
+    pub mono_font: FontConfig,
 }
 
 impl Default for ThemeBuilder {
@@ -945,6 +985,10 @@ impl Default for ThemeBuilder {
             frosted_applets: false,
             frosted_maximized_apps: false,
             alpha_map: AlphaMap::default(),
+            icon_theme: default_icon_theme(),
+            cursor_theme: None,
+            font: FontConfig::default(),
+            mono_font: default_mono_font(),
         }
     }
 }
@@ -1067,6 +1111,34 @@ impl ThemeBuilder {
         self
     }
 
+    #[inline]
+    /// set the icon theme of the builder
+    pub fn icon_theme(mut self, icon_theme: impl Into<String>) -> Self {
+        self.icon_theme = icon_theme.into();
+        self
+    }
+
+    #[inline]
+    /// set the cursor theme of the builder
+    pub fn cursor_theme(mut self, cursor_theme: Option<String>) -> Self {
+        self.cursor_theme = cursor_theme;
+        self
+    }
+
+    #[inline]
+    /// set the interface font of the builder
+    pub fn font(mut self, font: impl Into<FontConfig>) -> Self {
+        self.font = font.into();
+        self
+    }
+
+    #[inline]
+    /// set the monospace font of the builder
+    pub fn mono_font(mut self, font: impl Into<FontConfig>) -> Self {
+        self.mono_font = font.into();
+        self
+    }
+
     #[allow(clippy::too_many_lines)]
     /// build the theme
     pub fn build(self) -> Theme {
@@ -1093,6 +1165,10 @@ impl ThemeBuilder {
             frosted_applets,
             frosted_maximized_apps,
             alpha_map,
+            icon_theme,
+            cursor_theme,
+            font,
+            mono_font,
         } = self;
 
         let container_alpha = alpha_map.blurred_alpha(frosted);
@@ -1571,6 +1647,10 @@ impl ThemeBuilder {
             frosted_applets,
             frosted_maximized_apps,
             alpha_map,
+            icon_theme,
+            cursor_theme,
+            font,
+            mono_font,
             transparent_background: Container::new(
                 Component::component(
                     transparent_bg_component,

@@ -22,7 +22,7 @@ use crate::prelude::*;
 use crate::theme::THEME;
 use crate::widget::{container, id_container, menu, nav_bar, popover, space};
 use apply::Apply;
-use iced::{Color, Length, Subscription, theme, window};
+use iced::{Length, Subscription, theme, window};
 pub use settings::Settings;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -37,18 +37,15 @@ pub(crate) fn iced_settings<App: Application>(
 
     let mut core = Core::default();
     core.debug = settings.debug;
-    core.icon_theme_override = settings.default_icon_theme.is_some();
     core.set_scale_factor(settings.scale_factor);
     core.set_window_width(settings.size.width);
     core.set_window_height(settings.size.height);
 
+    THEME.lock().unwrap().set_theme(settings.theme.theme_type);
+
     if let Some(icon_theme) = settings.default_icon_theme {
         crate::icon_theme::set_default(icon_theme);
-    } else {
-        crate::icon_theme::set_default(crate::config::icon_theme());
     }
-
-    THEME.lock().unwrap().set_theme(settings.theme.theme_type);
 
     if settings.no_main_window {
         core.main_window = Some(iced::window::Id::NONE);
@@ -57,13 +54,17 @@ pub(crate) fn iced_settings<App: Application>(
     let mut iced = iced::Settings::default();
 
     iced.antialiasing = settings.antialiasing;
-    iced.default_font = settings.default_font;
+    iced.default_font = settings
+        .default_font
+        .unwrap_or_else(|| crate::font::from_config(&crate::theme::active().cosmic().font));
     iced.default_text_size = iced::Pixels(settings.default_text_size);
     let exit_on_close = settings.exit_on_close;
     iced.is_daemon = false;
     iced.exit_on_close_request = settings.is_daemon;
-    let mut window_settings = iced::window::Settings::default();
-    window_settings.exit_on_close_request = exit_on_close;
+    let mut window_settings = iced::window::Settings {
+        exit_on_close_request: exit_on_close,
+        ..Default::default()
+    };
     iced.id = Some(App::APP_ID.to_owned());
     #[cfg(target_os = "linux")]
     {
@@ -138,7 +139,6 @@ pub fn run<App: Application>(settings: Settings, flags: App::Flags) -> iced::Res
         crate::malloc::limit_mmap_threshold(threshold);
     }
 
-    let default_font = settings.default_font;
     let (settings, (mut core, flags), window_settings) = iced_settings::<App>(settings, flags);
     #[cfg(not(feature = "multi-window"))]
     {
@@ -215,45 +215,53 @@ where
 
     let path: String = format!("/{}", App::APP_ID.replace('.', "/"));
 
-    let Ok(conn) = zbus::blocking::Connection::session() else {
-        tracing::warn!("Failed to connect to dbus");
+    let activated = zbus::block_on(async {
+        let Ok(conn) = zbus::Connection::session().await else {
+            tracing::warn!("Failed to connect to dbus");
+            return None;
+        };
+
+        let builder = crate::dbus_activation::DbusActivationInterfaceProxy::builder(&conn)
+            .destination(App::APP_ID)
+            .path(path);
+        let Ok(mut proxy) = builder.build().await else {
+            return Some(false);
+        };
+
+        let mut platform_data = HashMap::new();
+        if let Some(activation_token) = activation_token {
+            platform_data.insert("activation-token", activation_token.into());
+        }
+        if let Ok(startup_id) = std::env::var("DESKTOP_STARTUP_ID") {
+            platform_data.insert("desktop-startup-id", startup_id.into());
+        }
+
+        let res = if let Some(action) = flags.action() {
+            let action = action.to_string();
+            proxy
+                .activate_action(&action, flags.args(), platform_data)
+                .await
+        } else {
+            proxy.activate(platform_data).await
+        };
+
+        match res {
+            Ok(()) => {
+                tracing::info!("Successfully activated another instance");
+                Some(true)
+            }
+            Err(err) => {
+                tracing::warn!(?err, "Failed to activate another instance");
+                Some(false)
+            }
+        }
+    });
+
+    let Some(activated) = activated else {
         return run::<App>(settings, flags);
     };
 
-    if crate::dbus_activation::DbusActivationInterfaceProxyBlocking::builder(&conn)
-        .destination(App::APP_ID)
-        .ok()
-        .and_then(|b| b.path(path).ok())
-        .and_then(|b| b.destination(App::APP_ID).ok())
-        .and_then(|b| b.build().ok())
-        .is_some_and(|mut p| {
-            let res = {
-                let mut platform_data = HashMap::new();
-                if let Some(activation_token) = activation_token {
-                    platform_data.insert("activation-token", activation_token.into());
-                }
-                if let Ok(startup_id) = std::env::var("DESKTOP_STARTUP_ID") {
-                    platform_data.insert("desktop-startup-id", startup_id.into());
-                }
-                if let Some(action) = flags.action() {
-                    let action = action.to_string();
-                    p.activate_action(&action, flags.args(), platform_data)
-                } else {
-                    p.activate(platform_data)
-                }
-            };
-            match res {
-                Ok(()) => {
-                    tracing::info!("Successfully activated another instance");
-                    true
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "Failed to activate another instance");
-                    false
-                }
-            }
-        })
-    {
+    if activated {
         tracing::info!("Another instance is running");
         Ok(())
     } else {
@@ -286,7 +294,7 @@ where
                 // app = app.window(window_settings);
                 core.main_window = Some(iced_core::window::Id::RESERVED);
             }
-            let mut app = iced::daemon(
+            let app = iced::daemon(
                 BootData(Rc::new(RefCell::new(Some(BootDataInner::<App> {
                     flags,
                     core,
@@ -660,6 +668,7 @@ impl<App: Application> ApplicationExt for App {
                 );
                 true
             } else {
+                widgets.push(space::horizontal().width(Length::Shrink).into());
                 false
             };
 

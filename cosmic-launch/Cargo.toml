@@ -5,9 +5,10 @@ edition.workspace = true
 
 [features]
 default = ["tokio", "systemd"]
-smol = ["dep:smol", "zbus?/async-io"]
-tokio = ["dep:tokio", "zbus?/tokio"]
-systemd = ["dep:zbus"]
+dbus = ["dep:zbus"]
+smol = ["dep:smol", "zbus?/default-rt"]
+tokio = ["dep:tokio", "tokio/io-util", "zbus?/tokio"]
+systemd = ["dep:zbus", "dbus"]
 
 [dependencies]
 bstr = "1.13.1"
@@ -16,10 +17,10 @@ freedesktop-desktop-entry = "0.8.4"
 error_set = "0.9.2"
 libc = "0.2.191"
 rand = "0.10.3"
-rustix = "1.1.5"
+rustix = "1.1.6"
 shlex = "2.0.1"
 smol = { workspace = true, optional = true }
-switcheroo-control = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+switcheroo-control-zbus = { git = "https://github.com/pop-os/dbus-settings-bindings" }
 tokio = { workspace = true, optional = true }
 tracing.workspace = true
 which = "8.0.6"

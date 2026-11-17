@@ -1,7 +1,7 @@
 //! Connect a window with a renderer.
 use wgpu::Backends;
 
-use crate::core::Color;
+use crate::core::{Color, Size};
 use crate::graphics::color;
 use crate::graphics::compositor;
 use crate::graphics::error;
@@ -261,8 +261,11 @@ impl Compositor {
             .using_resolution(adapter.limits())];
 
         #[cfg(not(target_arch = "wasm32"))]
-        let limits =
-            [wgpu::Limits::default(), wgpu::Limits::downlevel_defaults()];
+        let limits = [
+            wgpu::Limits::default().using_resolution(adapter.limits()),
+            wgpu::Limits::downlevel_defaults()
+                .using_resolution(adapter.limits()),
+        ];
 
         let limits = limits.into_iter().map(|limits| wgpu::Limits {
             max_bind_groups: 2,
@@ -344,6 +347,17 @@ pub fn present(
 ) -> Result<(), compositor::SurfaceError> {
     match surface.get_current_texture() {
         Ok(frame) => {
+            // configure_surface clamps to this limit
+            let max_extent =
+                renderer.engine.device.limits().max_texture_dimension_2d;
+            let viewport = &Viewport::with_physical_size(
+                Size::new(
+                    viewport.physical_width().min(max_extent),
+                    viewport.physical_height().min(max_extent),
+                ),
+                viewport.scale_factor(),
+            );
+
             if frame.texture.width() != viewport.physical_width()
                 || frame.texture.height() != viewport.physical_height()
             {
@@ -455,19 +469,25 @@ impl graphics::Compositor for Compositor {
         width: u32,
         height: u32,
     ) {
+        // windows past the GPU texture limit render clipped instead of panicking
+        let max_extent = self.engine.device.limits().max_texture_dimension_2d;
         surface.configure(
             &self.engine.device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.format,
                 present_mode: self.settings.present_mode,
-                width,
-                height,
+                width: width.min(max_extent),
+                height: height.min(max_extent),
                 alpha_mode: self.alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 1,
             },
         );
+    }
+
+    fn max_surface_dimension(&self) -> Option<u32> {
+        Some(self.engine.device.limits().max_texture_dimension_2d)
     }
 
     fn information(&self) -> compositor::Information {

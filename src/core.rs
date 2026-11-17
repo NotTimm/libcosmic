@@ -67,9 +67,6 @@ pub struct Core {
     /// Enables debug features in cosmic/iced.
     pub debug: bool,
 
-    /// Disables loading the icon theme from cosmic-config.
-    pub(super) icon_theme_override: bool,
-
     /// Whether the window is too small for the nav bar + main content.
     is_condensed: bool,
 
@@ -109,7 +106,8 @@ pub struct Core {
     pub(crate) single_instance: bool,
 
     #[cfg(all(feature = "dbus-config", target_os = "linux"))]
-    pub(crate) settings_daemon: Option<cosmic_settings_daemon::CosmicSettingsDaemonProxy<'static>>,
+    pub(crate) settings_daemon:
+        Option<cosmic_settings_daemon_zbus::CosmicSettingsDaemonProxy<'static>>,
 
     pub(crate) main_window: Option<window::Id>,
 
@@ -138,7 +136,6 @@ impl Default for Core {
     fn default() -> Self {
         Self {
             debug: false,
-            icon_theme_override: false,
             is_condensed: false,
             keyboard_nav: true,
             nav_bar: NavBar {

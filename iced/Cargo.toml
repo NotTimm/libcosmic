@@ -236,8 +236,6 @@ futures = { version = "0.3", default-features = false, features = [
 glam = "0.25"
 iced_accessibility = { version = "0.1", path = "accessibility" }
 
-async-std = "1.0"
-
 
 bitflags = "2.5"
 bytemuck = { version = "1.0", features = ["derive"] }
@@ -264,7 +262,7 @@ png = "0.18"
 pulldown-cmark = "0.12"
 qrcode = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
-rfd = "0.16"
+rfd = "0.17"
 rustc-hash = "2.0"
 semver = "1.0"
 serde = "1.0"
@@ -278,7 +276,7 @@ tiny-skia = { version = "0.11", default-features = false, features = [
     "std",
     "simd",
 ] }
-cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "c0cff4d" }
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit" }
 softbuffer = { git = "https://github.com/pop-os/softbuffer", tag = "cosmic-4.0" }
 syntect = "5.2"
 tokio = "1.0"

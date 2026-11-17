@@ -29,6 +29,8 @@ pub struct Viewer<'a, Handle, Message> {
     page: Option<u64>,
     whole: bool,
     fit_width: bool,
+    resume_at: Option<f32>,
+    on_fit_left: Option<Box<dyn Fn(f32) -> Message + 'a>>,
 }
 
 impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
@@ -48,6 +50,8 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
             page: None,
             whole: false,
             fit_width: false,
+            resume_at: None,
+            on_fit_left: None,
         }
     }
 
@@ -76,6 +80,22 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
     /// resized viewer keeps the image fitted.
     pub fn fit_width(mut self, fit: bool) -> Self {
         self.fit_width = fit;
+        self
+    }
+
+    /// Where Fit to Width starts when it's turned on from the whole page,
+    /// instead of the top: how far down the fitted page, from -1 (top) to 1
+    /// (bottom), as reported by [`Viewer::on_fit_left`]. Lets the app bring
+    /// a reader back to their place after a look at the whole page.
+    pub fn resume_at(mut self, place: Option<f32>) -> Self {
+        self.resume_at = place;
+        self
+    }
+
+    /// Sets the message produced when Fit to Width is turned off, with how
+    /// far down the fitted page the view was (-1 top to 1 bottom).
+    pub fn on_fit_left(mut self, f: impl Fn(f32) -> Message + 'a) -> Self {
+        self.on_fit_left = Some(Box::new(f));
         self
     }
 
@@ -244,12 +264,18 @@ where
                 to.scale = width_scale;
                 let hidden = hidden_height(renderer, &self.handle, &to, final_size, self.content_fit);
                 let y = if state.scale <= 1.0 {
-                    -hidden
+                    match self.resume_at {
+                        Some(place) => (place.clamp(-1.0, 1.0) * hidden).round(),
+                        None => -hidden,
+                    }
                 } else {
                     (from_offset.y * width_scale / state.scale).clamp(-hidden, hidden)
                 };
                 (width_scale, Vector::new(0.0, y))
             } else {
+                // Left: say how far down the fitted page the view was.
+                let hidden = hidden_height(renderer, &self.handle, state, final_size, self.content_fit);
+                state.fit_left = Some(if hidden > 0.0 { from_offset.y / hidden } else { -1.0 });
                 (1.0, Vector::default())
             };
             state.ease = Some(Ease { from_scale: state.scale, from_offset, to_scale, to_offset, start: None });
@@ -277,6 +303,12 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
+
+        if let Some(place) = tree.state.downcast_mut::<State>().fit_left.take() {
+            if let Some(on_fit_left) = &self.on_fit_left {
+                shell.publish(on_fit_left(place));
+            }
+        }
 
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
@@ -903,6 +935,9 @@ pub struct State {
     ease: Option<Ease>,
     /// Up or Down held.
     key_scroll: Option<KeyScroll>,
+    /// Fit to Width was just turned off here, this far down the page; sent
+    /// with the next event.
+    fit_left: Option<f32>,
 }
 
 impl Default for State {
@@ -926,6 +961,7 @@ impl Default for State {
             fit_width: false,
             ease: None,
             key_scroll: None,
+            fit_left: None,
         }
     }
 }
@@ -1745,7 +1781,11 @@ mod fit_width_tests {
 
         /// Rebuilds the viewer (as the app's view does) and lays it out.
         fn show(&mut self, fit: bool, page: u64) {
-            self.viewer = Self::viewer(fit, page);
+            self.show_resuming(fit, page, None);
+        }
+
+        fn show_resuming(&mut self, fit: bool, page: u64, place: Option<f32>) {
+            self.viewer = Self::viewer(fit, page).resume_at(place);
             let _ = Widget::<(), (), ()>::layout(
                 &mut self.viewer,
                 &mut self.tree,
@@ -1922,5 +1962,33 @@ mod fit_width_tests {
         h.show(true, 1);
         h.settle();
         assert_eq!(h.state().scale, 1.0);
+    }
+
+    #[test]
+    fn turning_it_off_and_on_comes_back_to_the_same_place() {
+        let mut h = Harness::new();
+        h.show(true, 1);
+        h.settle();
+        // Halfway down: 100 px from the top of a 300 px page in 100 px.
+        h.wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -150.0 });
+        assert_eq!(h.state().current_offset.y, 50.0);
+        h.show(false, 1);
+        assert_eq!(h.state().fit_left, Some(0.5));
+        h.settle();
+        // Sent once, with the next event.
+        assert_eq!(h.state().fit_left, None);
+        assert_eq!(h.state().scale, 1.0);
+        h.show_resuming(true, 1, Some(0.5));
+        h.settle();
+        assert_eq!(h.state().scale, 3.0);
+        assert_eq!(h.state().current_offset.y, 50.0);
+    }
+
+    #[test]
+    fn a_fresh_viewer_with_nowhere_to_resume_starts_at_the_top() {
+        let mut h = Harness::new();
+        h.show_resuming(true, 1, None);
+        h.settle();
+        assert_eq!(h.state().current_offset.y, -100.0);
     }
 }

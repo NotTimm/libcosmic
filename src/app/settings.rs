@@ -68,9 +68,24 @@ pub struct Settings {
 
     /// Whether the application should act as a daemon
     pub(crate) is_daemon: bool,
+
+    /// Windows: the main window's platform settings (a system backdrop
+    /// such as Mica, no redirection bitmap…), when set.
+    #[cfg(windows)]
+    #[setters(skip)]
+    pub(crate) windows_window: Option<iced_core::window::settings::PlatformSpecific>,
 }
 
 impl Settings {
+    /// Windows: sets the main window's platform settings (see
+    /// [`iced_core::window::settings::PlatformSpecific`]), such as a system
+    /// backdrop.
+    #[cfg(windows)]
+    pub fn windows_window(mut self, value: iced_core::window::settings::PlatformSpecific) -> Self {
+        self.windows_window = Some(value);
+        self
+    }
+
     /// Override the font used by the application.
     ///
     /// By default, the font from the active theme is used.
@@ -112,6 +127,8 @@ impl Default for Settings {
             transparent: true,
             exit_on_close: true,
             is_daemon: true,
+            #[cfg(windows)]
+            windows_window: None,
         }
     }
 }

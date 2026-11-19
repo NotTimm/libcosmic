@@ -121,7 +121,7 @@ pub fn window_attributes(
     {
         use window::settings::platform;
         use winit::platform::windows::{
-            CornerPreference, WindowAttributesWindows,
+            BackdropType, CornerPreference, WindowAttributesWindows,
         };
         let mut w_attributes = WindowAttributesWindows::default();
 
@@ -149,6 +149,24 @@ pub fn window_attributes(
                 }
             },
         );
+
+        w_attributes = w_attributes
+            .with_system_backdrop(
+                match settings.platform_specific.system_backdrop {
+                    platform::SystemBackdrop::Auto => BackdropType::Auto,
+                    platform::SystemBackdrop::None => BackdropType::None,
+                    platform::SystemBackdrop::Mica => BackdropType::MainWindow,
+                    platform::SystemBackdrop::Acrylic => {
+                        BackdropType::TransientWindow
+                    }
+                    platform::SystemBackdrop::MicaAlt => {
+                        BackdropType::TabbedWindow
+                    }
+                },
+            )
+            .with_no_redirection_bitmap(
+                settings.platform_specific.no_redirection_bitmap,
+            );
         attributes =
             attributes.with_platform_attributes(Box::new(w_attributes));
     }

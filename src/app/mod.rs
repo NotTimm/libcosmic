@@ -76,6 +76,10 @@ pub(crate) fn iced_settings<App: Application>(
         window_settings.resize_border = border_size as u32;
         window_settings.resizable = true;
     }
+    #[cfg(windows)]
+    if let Some(platform) = settings.windows_window {
+        window_settings.platform_specific = platform;
+    }
     window_settings.decorations = !settings.client_decorations;
     core.window.system_decorations = !settings.client_decorations;
     core.window.sharp_corners |= core.window.system_decorations;

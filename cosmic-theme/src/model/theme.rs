@@ -411,6 +411,15 @@ impl Theme {
     #[must_use]
     #[allow(clippy::doc_markdown)]
     #[inline]
+    /// Lets the window's own background show through to `alpha` of its
+    /// colour, everything drawn on it unchanged: for a backdrop the system
+    /// draws behind the window (Windows 11's Mica or Acrylic).
+    #[must_use]
+    pub fn with_background_alpha(mut self, alpha: f32) -> Self {
+        self.background.base.alpha = alpha.clamp(0.0, 1.0);
+        self
+    }
+
     /// get @bg_color
     pub fn bg_color(&self) -> Srgba {
         self.background.base

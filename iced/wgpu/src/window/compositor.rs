@@ -95,6 +95,7 @@ impl Compositor {
                 } else {
                     wgpu::InstanceFlags::empty()
                 },
+                backend_options: backend_options(),
                 ..Default::default()
             },
         )
@@ -182,6 +183,7 @@ impl Compositor {
                         } else {
                             wgpu::InstanceFlags::empty()
                         },
+                        backend_options: backend_options(),
                         ..Default::default()
                     },
                 )
@@ -236,7 +238,16 @@ impl Compositor {
 
                 log::info!("Available alpha modes: {alpha_modes:#?}");
 
-                let preferred_alpha = if alpha_modes
+                // Windows' compositor takes premultiplied alpha only (a
+                // DirectComposition swap chain refuses DXGI's straight
+                // alpha), and what's drawn over the transparent clear
+                // colour is premultiplied already.
+                let preferred_alpha = if cfg!(windows)
+                    && alpha_modes
+                        .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+                {
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                } else if alpha_modes
                     .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
                 {
                     wgpu::CompositeAlphaMode::PostMultiplied
@@ -523,5 +534,23 @@ impl graphics::Compositor for Compositor {
         background_color: Color,
     ) -> Vec<u8> {
         renderer.screenshot(viewport, background_color)
+    }
+}
+
+/// The backends' options. On Windows, Direct3D 12's presentation system can
+/// be chosen with `WGPU_DX12_PRESENTATION_SYSTEM` (`Visual` draws through
+/// DirectComposition, which lets a window be see-through, as for Windows
+/// 11's Mica backdrop); elsewhere, wgpu's defaults.
+fn backend_options() -> wgpu::BackendOptions {
+    #[cfg(windows)]
+    {
+        wgpu::BackendOptions {
+            dx12: wgpu::Dx12BackendOptions::from_env_or_default(),
+            ..Default::default()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        wgpu::BackendOptions::default()
     }
 }

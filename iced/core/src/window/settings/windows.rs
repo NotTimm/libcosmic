@@ -19,6 +19,17 @@ pub struct PlatformSpecific {
     ///
     /// Supported starting with Windows 11 Build 22000.
     pub corner_preference: CornerPreference,
+
+    /// The material Windows draws behind the window (Mica, Acrylic…),
+    /// seen where a transparent window draws see-through.
+    ///
+    /// Supported starting with Windows 11 Build 22621.
+    pub system_backdrop: SystemBackdrop,
+
+    /// Leaves out the window's GDI redirection surface
+    /// (`WS_EX_NOREDIRECTIONBITMAP`), for a window drawn only through
+    /// DirectComposition, so its see-through parts show the backdrop.
+    pub no_redirection_bitmap: bool,
 }
 
 impl Default for PlatformSpecific {
@@ -28,8 +39,27 @@ impl Default for PlatformSpecific {
             skip_taskbar: false,
             undecorated_shadow: false,
             corner_preference: Default::default(),
+            system_backdrop: Default::default(),
+            no_redirection_bitmap: false,
         }
     }
+}
+
+/// A material Windows draws behind a window (`DWM_SYSTEMBACKDROP_TYPE`).
+#[repr(i32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemBackdrop {
+    /// Corresponds to `DWMSBT_AUTO`: the system decides.
+    #[default]
+    Auto = 0,
+    /// Corresponds to `DWMSBT_NONE`.
+    None = 1,
+    /// Corresponds to `DWMSBT_MAINWINDOW`: Mica.
+    Mica = 2,
+    /// Corresponds to `DWMSBT_TRANSIENTWINDOW`: Acrylic.
+    Acrylic = 3,
+    /// Corresponds to `DWMSBT_TABBEDWINDOW`: Mica Alt.
+    MicaAlt = 4,
 }
 
 /// Describes how the corners of a window should look like.

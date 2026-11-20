@@ -23,6 +23,7 @@ pub struct Viewer<'a, Handle, Message> {
     max_scale: f32,
     scale_step: f32,
     handle: Handle,
+    second: Option<Handle>,
     filter_method: FilterMethod,
     content_fit: ContentFit,
     on_zoom: Option<Box<dyn Fn(f32) -> Message + 'a>>,
@@ -31,6 +32,7 @@ pub struct Viewer<'a, Handle, Message> {
     fit_width: bool,
     resume_at: Option<f32>,
     on_fit_left: Option<Box<dyn Fn(f32) -> Message + 'a>>,
+    reset: u64,
 }
 
 impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
@@ -38,6 +40,7 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
     pub fn new<T: Into<Handle>>(handle: T) -> Self {
         Viewer {
             handle: handle.into(),
+            second: None,
             padding: 0.0,
             width: Length::Shrink,
             height: Length::Shrink,
@@ -52,7 +55,23 @@ impl<'a, Handle, Message> Viewer<'a, Handle, Message> {
             fit_width: false,
             resume_at: None,
             on_fit_left: None,
+            reset: 0,
         }
+    }
+
+    /// Displays a second image joined flush to the right of the primary image,
+    /// height-matched at the center spine so both pages zoom and pan together
+    /// as a single bound spread.
+    pub fn second(mut self, second: Option<Handle>) -> Self {
+        self.second = second;
+        self
+    }
+
+    /// Resets zoom and pan back to the whole view whenever `generation`
+    /// changes.
+    pub fn reset(mut self, generation: u64) -> Self {
+        self.reset = generation;
+        self
     }
 
     /// Sets a message to be produced whenever the [`Viewer`]'s zoom scale changes.
@@ -188,12 +207,9 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        // The raw w/h of the underlying image
-        let image_size =
-            renderer.measure_image(&self.handle).unwrap_or_default();
-
-        let image_size =
-            Size::new(image_size.width as f32, image_size.height as f32);
+        // The raw w/h of the underlying image (or height-matched spread)
+        let (image_size, _) =
+            content_size(renderer, &self.handle, self.second.as_ref());
 
         // The size to be available to the widget prior to `Shrink`ing
         let raw_size = limits.resolve(self.width, self.height, image_size);
@@ -217,7 +233,23 @@ where
         // (a spread) is zoomed out to fit, and the zoom from before comes
         // back after it.
         let state = tree.state.downcast_mut::<State>();
-        let width_scale = fit_width_scale(renderer, &self.handle, final_size, self.content_fit);
+        if state.reset != self.reset {
+            state.reset = self.reset;
+            state.scale = 1.0;
+            state.current_offset = Vector::default();
+            state.starting_offset = Vector::default();
+            state.saved_scale = None;
+            state.fling = None;
+            state.ease = None;
+            state.key_scroll = None;
+        }
+        let width_scale = fit_width_scale(
+            renderer,
+            &self.handle,
+            self.second.as_ref(),
+            final_size,
+            self.content_fit,
+        );
         if self.page.is_some() && state.page != self.page {
             // A flick on the last page doesn't carry over to this one.
             state.fling = None;
@@ -225,7 +257,17 @@ where
                 // Fitted to width: this page too, from its top.
                 state.ease = None;
                 state.scale = width_scale;
-                state.current_offset = Vector::new(0.0, -hidden_height(renderer, &self.handle, state, final_size, self.content_fit));
+                state.current_offset = Vector::new(
+                    0.0,
+                    -hidden_height(
+                        renderer,
+                        &self.handle,
+                        self.second.as_ref(),
+                        state,
+                        final_size,
+                        self.content_fit,
+                    ),
+                );
                 state.starting_offset = state.current_offset;
             } else if state.page.is_some() {
                 if self.whole {
@@ -238,7 +280,14 @@ where
                     if let Some(scale) = state.saved_scale.take() {
                         state.scale = scale;
                     }
-                    let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
+                    let scaled = scaled_content_size(
+                        renderer,
+                        &self.handle,
+                        self.second.as_ref(),
+                        state,
+                        final_size,
+                        self.content_fit,
+                    );
                     let hidden_height = ((scaled.height - final_size.height) / 2.0).max(0.0).round();
                     state.current_offset.y = -hidden_height;
                 }
@@ -257,12 +306,26 @@ where
             state.fit_width = self.fit_width;
             state.fling = None;
             state.saved_scale = None;
-            let scaled = scaled_image_size(renderer, &self.handle, state, final_size, self.content_fit);
+            let scaled = scaled_content_size(
+                renderer,
+                &self.handle,
+                self.second.as_ref(),
+                state,
+                final_size,
+                self.content_fit,
+            );
             let from_offset = state.offset(Rectangle::with_size(final_size), scaled);
             let (to_scale, to_offset) = if self.fit_width {
                 let mut to = *state;
                 to.scale = width_scale;
-                let hidden = hidden_height(renderer, &self.handle, &to, final_size, self.content_fit);
+                let hidden = hidden_height(
+                    renderer,
+                    &self.handle,
+                    self.second.as_ref(),
+                    &to,
+                    final_size,
+                    self.content_fit,
+                );
                 let y = if state.scale <= 1.0 {
                     match self.resume_at {
                         Some(place) => (place.clamp(-1.0, 1.0) * hidden).round(),
@@ -274,7 +337,14 @@ where
                 (width_scale, Vector::new(0.0, y))
             } else {
                 // Left: say how far down the fitted page the view was.
-                let hidden = hidden_height(renderer, &self.handle, state, final_size, self.content_fit);
+                let hidden = hidden_height(
+                    renderer,
+                    &self.handle,
+                    self.second.as_ref(),
+                    state,
+                    final_size,
+                    self.content_fit,
+                );
                 state.fit_left = Some(if hidden > 0.0 { from_offset.y / hidden } else { -1.0 });
                 (1.0, Vector::default())
             };
@@ -283,7 +353,14 @@ where
             // Resized: still as wide as the viewer, at the same place.
             state.current_offset.y *= width_scale / state.scale;
             state.scale = width_scale;
-            let hidden = hidden_height(renderer, &self.handle, state, final_size, self.content_fit);
+            let hidden = hidden_height(
+                renderer,
+                &self.handle,
+                self.second.as_ref(),
+                state,
+                final_size,
+                self.content_fit,
+            );
             state.current_offset = Vector::new(0.0, state.current_offset.y.clamp(-hidden, hidden));
             state.starting_offset = state.current_offset;
         }
@@ -399,7 +476,15 @@ where
                             Vector::new(x * per_line, y * per_line)
                         }
                     };
-                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    let _ = pan_by(
+                        state,
+                        moved,
+                        bounds,
+                        renderer,
+                        &self.handle,
+                        self.second.as_ref(),
+                        self.content_fit,
+                    );
                     shell.request_redraw();
                     shell.capture_event();
                     return;
@@ -426,7 +511,15 @@ where
                     } else {
                         Vector::new(x, y)
                     };
-                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    let _ = pan_by(
+                        state,
+                        moved,
+                        bounds,
+                        renderer,
+                        &self.handle,
+                        self.second.as_ref(),
+                        self.content_fit,
+                    );
                     shell.request_redraw();
                     shell.capture_event();
                     return;
@@ -451,6 +544,7 @@ where
                         bounds,
                         renderer,
                         &self.handle,
+                        self.second.as_ref(),
                         self.content_fit,
                     );
 
@@ -499,6 +593,7 @@ where
                     bounds,
                     renderer,
                     &self.handle,
+                    self.second.as_ref(),
                     self.content_fit,
                 );
 
@@ -538,6 +633,7 @@ where
                     bounds,
                     renderer,
                     &self.handle,
+                    self.second.as_ref(),
                     self.content_fit,
                 );
 
@@ -637,6 +733,7 @@ where
                                             bounds,
                                             renderer,
                                             &self.handle,
+                                            self.second.as_ref(),
                                             self.content_fit,
                                         );
 
@@ -653,6 +750,7 @@ where
                                     bounds,
                                     renderer,
                                     &self.handle,
+                                    self.second.as_ref(),
                                     self.content_fit,
                                 );
                             }
@@ -667,6 +765,7 @@ where
                                 bounds,
                                 renderer,
                                 &self.handle,
+                                self.second.as_ref(),
                                 self.content_fit,
                             );
                             state.velocity.track(moved, now);
@@ -727,7 +826,15 @@ where
                 }
                 if let Some(scroll) = state.key_scroll.as_mut() {
                     let moved = scroll.step(*now, bounds.height);
-                    let _ = pan_by(state, moved, bounds, renderer, &self.handle, self.content_fit);
+                    let _ = pan_by(
+                        state,
+                        moved,
+                        bounds,
+                        renderer,
+                        &self.handle,
+                        self.second.as_ref(),
+                        self.content_fit,
+                    );
                     shell.request_redraw();
                     return;
                 }
@@ -741,6 +848,7 @@ where
                     bounds,
                     renderer,
                     &self.handle,
+                    self.second.as_ref(),
                     self.content_fit,
                 );
                 if let Some(fling) = state.fling.as_mut() {
@@ -771,6 +879,20 @@ where
                     return;
                 }
 
+                let scaled = scaled_content_size(
+                    renderer,
+                    &self.handle,
+                    self.second.as_ref(),
+                    state,
+                    bounds.size(),
+                    self.content_fit,
+                );
+                if scaled.width <= bounds.width + 0.5
+                    && scaled.height <= bounds.height + 0.5
+                {
+                    return;
+                }
+
                 state.fling = None;
                 state.finish_ease();
                 state.cursor_grabbed_at = Some(cursor_position);
@@ -787,9 +909,10 @@ where
                 let state = tree.state.downcast_mut::<State>();
 
                 if let Some(origin) = state.cursor_grabbed_at {
-                    let scaled_size = scaled_image_size(
+                    let scaled_size = scaled_content_size(
                         renderer,
                         &self.handle,
+                        self.second.as_ref(),
                         state,
                         bounds.size(),
                         self.content_fit,
@@ -835,7 +958,7 @@ where
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
-        _renderer: &Renderer,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
@@ -844,7 +967,21 @@ where
         if state.is_cursor_grabbed() {
             mouse::Interaction::Grabbing
         } else if is_mouse_over {
-            mouse::Interaction::Grab
+            let scaled = scaled_content_size(
+                renderer,
+                &self.handle,
+                self.second.as_ref(),
+                state,
+                bounds.size(),
+                self.content_fit,
+            );
+            if scaled.width > bounds.width + 0.5
+                || scaled.height > bounds.height + 0.5
+            {
+                mouse::Interaction::Grab
+            } else {
+                mouse::Interaction::None
+            }
         } else {
             mouse::Interaction::None
         }
@@ -863,12 +1000,12 @@ where
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
 
-        let final_size = scaled_image_size(
-            renderer,
-            &self.handle,
-            state,
-            bounds.size(),
-            self.content_fit,
+        let (combined_size, left_frac) =
+            content_size(renderer, &self.handle, self.second.as_ref());
+        let adjusted_fit = self.content_fit.fit(combined_size, bounds.size());
+        let final_size = Size::new(
+            adjusted_fit.width * state.scale,
+            adjusted_fit.height * state.scale,
         );
 
         let translation = {
@@ -889,6 +1026,48 @@ where
 
         let render = |renderer: &mut Renderer| {
             renderer.with_translation(translation, |renderer| {
+                let clip = *viewport - translation;
+                if let Some(second) = &self.second {
+                    if left_frac < 1.0 {
+                        let spine_x = (final_size.width * left_frac).round();
+                        let left_bounds = Rectangle::new(
+                            bounds.position(),
+                            Size::new(spine_x, final_size.height),
+                        );
+                        let right_bounds = Rectangle::new(
+                            Point::new(bounds.x + spine_x, bounds.y),
+                            Size::new(
+                                (final_size.width - spine_x).max(0.0),
+                                final_size.height,
+                            ),
+                        );
+                        renderer.draw_image(
+                            Image {
+                                handle: self.handle.clone(),
+                                border_radius: border::Radius::default(),
+                                filter_method: self.filter_method,
+                                rotation: Radians(0.0),
+                                opacity: 1.0,
+                                snap: true,
+                            },
+                            left_bounds,
+                            clip,
+                        );
+                        renderer.draw_image(
+                            Image {
+                                handle: second.clone(),
+                                border_radius: border::Radius::default(),
+                                filter_method: self.filter_method,
+                                rotation: Radians(0.0),
+                                opacity: 1.0,
+                                snap: true,
+                            },
+                            right_bounds,
+                            clip,
+                        );
+                        return;
+                    }
+                }
                 renderer.draw_image(
                     Image {
                         handle: self.handle.clone(),
@@ -899,7 +1078,7 @@ where
                         snap: true,
                     },
                     drawing_bounds,
-                    *viewport - translation,
+                    clip,
                 );
             });
         };
@@ -938,6 +1117,8 @@ pub struct State {
     /// Fit to Width was just turned off here, this far down the page; sent
     /// with the next event.
     fit_left: Option<f32>,
+    /// Last `Viewer::reset` generation seen.
+    reset: u64,
 }
 
 impl Default for State {
@@ -962,6 +1143,7 @@ impl Default for State {
             ease: None,
             key_scroll: None,
             fit_left: None,
+            reset: 0,
         }
     }
 }
@@ -1123,19 +1305,68 @@ impl Ease {
     const DURATION: Duration = Duration::from_millis(160);
 }
 
+/// Measures the logical size of the viewer's content and the left page's share
+/// of total width (`1.0` for a single page). When a second image is present,
+/// both pages are height-matched to the taller image and placed flush
+/// side-by-side at the center spine.
+fn content_size<Renderer>(
+    renderer: &Renderer,
+    handle: &<Renderer as image::Renderer>::Handle,
+    second: Option<&<Renderer as image::Renderer>::Handle>,
+) -> (Size, f32)
+where
+    Renderer: image::Renderer,
+{
+    let first = renderer.measure_image(handle).unwrap_or_default();
+    let (w1, h1) = (first.width as f32, first.height as f32);
+    let Some(second) = second else {
+        return (Size::new(w1, h1), 1.0);
+    };
+    let other = renderer.measure_image(second).unwrap_or_default();
+    let (w2, h2) = (other.width as f32, other.height as f32);
+    if w1 <= 0.0 || h1 <= 0.0 || w2 <= 0.0 || h2 <= 0.0 {
+        return (Size::new(w1, h1), 1.0);
+    }
+    let h = h1.max(h2);
+    let lw = w1 * (h / h1);
+    let rw = w2 * (h / h2);
+    let total_w = lw + rw;
+    (Size::new(total_w, h), lw / total_w)
+}
+
+fn scaled_content_size<Renderer>(
+    renderer: &Renderer,
+    handle: &<Renderer as image::Renderer>::Handle,
+    second: Option<&<Renderer as image::Renderer>::Handle>,
+    state: &State,
+    bounds: Size,
+    content_fit: ContentFit,
+) -> Size
+where
+    Renderer: image::Renderer,
+{
+    let (image_size, _) = content_size(renderer, handle, second);
+    let adjusted_fit = content_fit.fit(image_size, bounds);
+    Size::new(
+        adjusted_fit.width * state.scale,
+        adjusted_fit.height * state.scale,
+    )
+}
+
 /// The scale (relative to `content_fit`) at which the image is exactly as
 /// wide as `bounds`; 1.0 when it already fills the width.
 fn fit_width_scale<Renderer>(
     renderer: &Renderer,
     handle: &<Renderer as image::Renderer>::Handle,
+    second: Option<&<Renderer as image::Renderer>::Handle>,
     bounds: Size,
     content_fit: ContentFit,
 ) -> f32
 where
     Renderer: image::Renderer,
 {
-    let Size { width, height } = renderer.measure_image(handle).unwrap_or_default();
-    let fitted = content_fit.fit(Size::new(width as f32, height as f32), bounds);
+    let (image_size, _) = content_size(renderer, handle, second);
+    let fitted = content_fit.fit(image_size, bounds);
     if fitted.width <= 0.0 {
         return 1.0;
     }
@@ -1146,6 +1377,7 @@ where
 fn hidden_height<Renderer>(
     renderer: &Renderer,
     handle: &<Renderer as image::Renderer>::Handle,
+    second: Option<&<Renderer as image::Renderer>::Handle>,
     state: &State,
     bounds: Size,
     content_fit: ContentFit,
@@ -1153,7 +1385,8 @@ fn hidden_height<Renderer>(
 where
     Renderer: image::Renderer,
 {
-    let scaled = scaled_image_size(renderer, handle, state, bounds, content_fit);
+    let scaled =
+        scaled_content_size(renderer, handle, second, state, bounds, content_fit);
     ((scaled.height - bounds.height) / 2.0).max(0.0).round()
 }
 
@@ -1259,13 +1492,20 @@ fn pan_by<Renderer, Handle>(
     bounds: Rectangle,
     renderer: &Renderer,
     handle: &Handle,
+    second: Option<&Handle>,
     content_fit: ContentFit,
 ) -> (bool, bool)
 where
     Renderer: image::Renderer<Handle = Handle>,
 {
-    let scaled_size =
-        scaled_image_size(renderer, handle, state, bounds.size(), content_fit);
+    let scaled_size = scaled_content_size(
+        renderer,
+        handle,
+        second,
+        state,
+        bounds.size(),
+        content_fit,
+    );
     let hidden_width =
         ((scaled_size.width - bounds.width) / 2.0).max(0.0).round();
     let hidden_height =
@@ -1287,6 +1527,7 @@ fn apply_zoom<Renderer, Handle>(
     bounds: Rectangle,
     renderer: &Renderer,
     handle: &Handle,
+    second: Option<&Handle>,
     content_fit: ContentFit,
 ) where
     Renderer: image::Renderer<Handle = Handle>,
@@ -1294,8 +1535,14 @@ fn apply_zoom<Renderer, Handle>(
     let previous_scale = state.scale;
     state.scale = new_scale;
 
-    let scaled_size =
-        scaled_image_size(renderer, handle, state, bounds.size(), content_fit);
+    let scaled_size = scaled_content_size(
+        renderer,
+        handle,
+        second,
+        state,
+        bounds.size(),
+        content_fit,
+    );
 
     let factor = state.scale / previous_scale - 1.0;
 
@@ -1990,5 +2237,54 @@ mod fit_width_tests {
         h.show_resuming(true, 1, None);
         h.settle();
         assert_eq!(h.state().current_offset.y, -100.0);
+    }
+
+    #[test]
+    fn dual_spread_combines_width_and_resets_cleanly() {
+        let a = image::Handle::from_rgba(1, 1, vec![0; 4]);
+        let b = image::Handle::from_rgba(1, 1, vec![0; 4]);
+        // Null renderer reports 100×100 for each image -> 200×100 bound spread.
+        let (size, frac) = content_size(&(), &a, Some(&b));
+        assert_eq!(size, Size::new(200.0, 100.0));
+        assert!((frac - 0.5).abs() < 1e-6);
+
+        let mut tree = Tree {
+            tag: tree::Tag::of::<State>(),
+            id: None,
+            state: tree::State::new(State {
+                scale: 2.0,
+                current_offset: Vector::new(40.0, 20.0),
+                ..State::default()
+            }),
+            children: Vec::new(),
+        };
+        let mut viewer: Viewer<'static, image::Handle, ()> = Viewer::new(a.clone())
+            .second(Some(b.clone()))
+            .content_fit(ContentFit::Contain)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .reset(0);
+        // In a 200×100 viewport, 200×100 spread at 2× is 400×200 -> ±100 px x, ±50 px y.
+        let scaled = scaled_content_size(
+            &(),
+            &a,
+            Some(&b),
+            tree.state.downcast_ref::<State>(),
+            Size::new(200.0, 100.0),
+            ContentFit::Contain,
+        );
+        assert_eq!(scaled, Size::new(400.0, 200.0));
+
+        // Bumping reset generation restores 1× and zero offset.
+        viewer = viewer.reset(1);
+        let _ = Widget::<(), (), ()>::layout(
+            &mut viewer,
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 100.0)),
+        );
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(state.scale, 1.0);
+        assert_eq!(state.current_offset, Vector::default());
     }
 }
